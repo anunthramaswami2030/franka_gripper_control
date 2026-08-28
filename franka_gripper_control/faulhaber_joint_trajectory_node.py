@@ -535,7 +535,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--calibration-service",
         default="/faulhaber_gripper/calibrate",
     )
-    parser.add_argument("--max-width-mm", type=float, default=105.0)
+    parser.add_argument("--max-width-mm", type=float, default=82.0)
     parser.add_argument("--current-limit-ma", type=int, default=300)
     parser.add_argument("--stall-current-ma", type=int, default=220)
     parser.add_argument("--first-speed-rpm", type=int, default=60)
