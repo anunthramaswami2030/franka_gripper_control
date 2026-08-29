@@ -161,7 +161,6 @@ class FaulhaberTrajectoryNode(Node):
         self._state_lock = threading.Lock()
         self._last_warning_mono = 0.0
         self._message_count = 0
-        self._clamped_count = 0
         self._current_command_mm: float | None = None
         self._tracking_ready = False
         self.subscription = self.create_subscription(
@@ -338,14 +337,11 @@ class FaulhaberTrajectoryNode(Node):
                 return
             width_mm = width_m * 1000.0
             if width_mm < 0.0 or width_mm > self.args.max_width_mm:
-                if not self.args.clamp_width:
-                    self._warn_throttled(
-                        f"Rejecting width {width_mm:.3f} mm outside "
-                        f"[0, {self.args.max_width_mm:g}] mm"
-                    )
-                    return
+                self._warn_throttled(
+                    f"Clamping width {width_mm:.3f} mm into "
+                    f"[0, {self.args.max_width_mm:g}] mm"
+                )
                 width_mm = min(self.args.max_width_mm, max(0.0, width_mm))
-                self._clamped_count += 1
             if previous_ns is not None:
                 if absolute_ns <= previous_ns:
                     self._warn_throttled("Ignoring trajectory with non-increasing times")
@@ -484,7 +480,7 @@ class FaulhaberTrajectoryNode(Node):
                         else f"{self.args.max_tracking_error_mm:g}mm"
                     )
 
-                    self.get_logger().info(
+                    self.get_logger().debug(
                         f"desired={desired_mm:7.2f} mm "
                         f"actual={feedback.width_mm:7.2f} mm "
                         f"error={error_mm:+6.2f} mm "
@@ -535,7 +531,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--calibration-service",
         default="/faulhaber_gripper/calibrate",
     )
-    parser.add_argument("--max-width-mm", type=float, default=82.0)
+    parser.add_argument("--max-width-mm", type=float, default=81.2)
     parser.add_argument("--current-limit-ma", type=int, default=300)
     parser.add_argument("--stall-current-ma", type=int, default=220)
     parser.add_argument("--first-speed-rpm", type=int, default=60)
@@ -561,7 +557,6 @@ def build_parser() -> argparse.ArgumentParser:
         default=121000.0,
         help="Conservative raw stroke estimate used only for preflight speed checks",
     )
-    parser.add_argument("--clamp-width", action="store_true")
     return parser
 
 

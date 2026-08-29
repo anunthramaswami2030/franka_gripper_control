@@ -210,7 +210,7 @@ ros2 service list | grep faulhaber_gripper
 ## Safety and shutdown behavior
 
 - The node holds the current calibrated width until the first trajectory is received.
-- An out-of-range width is rejected rather than clamped by the current launch configuration.
+- An out-of-range width is clamped into `[0, --max-width-mm]`, with a throttled warning.
 - Excessive estimated waypoint-to-waypoint speed causes the complete incoming trajectory message to be rejected.
 - With `max_tracking_error_mm:=0`, contact-induced following error does not stop tracking; the CSP current limit remains active.
 - Communication failure, excessive scheduler lateness, or another drive error requests Quick Stop and disables the drive during shutdown.

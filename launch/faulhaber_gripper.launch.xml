@@ -34,7 +34,7 @@
   <arg name="waypoint_error_topic"
        default="/faulhaber_gripper/waypoint_tracking_error_mm"/>
   <arg name="max_width_mm"
-       default="82.0"
+       default="81.2"
        description="Calibrated fully-open gripper width in millimetres"/>
 
   <node pkg="franka_gripper_control"

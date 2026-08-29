@@ -711,7 +711,7 @@ class CalibrationOptions:
     endpoint_margin: int = 100
     stall_velocity_rpm: int = 5
     stall_position_span: int = 25
-    max_width_mm: float = 105.0
+    max_width_mm: float = 81.2
 
 
 @dataclass(frozen=True)
