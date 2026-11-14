@@ -11,6 +11,10 @@ This ROS 2 package controls a FAULHABER-driven gripper over CANopen. It provides
 - a read-only connection checker for diagnosing SocketCAN and CANopen without
   enabling or moving the drive.
 
+To get running, jump to the [Quickstart](#quickstart). If CANopen is new to
+you, the [CAN and CANopen glossary](#can-and-canopen-glossary) briefly defines
+the protocol terms used throughout this README.
+
 The user-facing gripper convention is:
 
 | Quantity | Convention |
@@ -99,29 +103,49 @@ Inline citations below link to the first relevant PDF page. The
 [`docs` index](docs/README.md) contains a page map and SHA-256 checksum for each
 unchanged source document.
 
-## Build and install
+## Quickstart
 
-Install the ROS dependencies for the workspace, then build the package:
+This path covers a new checkout through first commanded motion. It assumes:
+
+- ROS 2, `colcon`, and `rosdep` are installed and the ROS installation is
+  sourced;
+- the motor/controller is powered and wired to a Linux CAN adapter according
+  to the exact product datasheet;
+- the CAN bus is terminated with 120 ohms at each physical end; and
+- the default controller settings are node ID `1` and `500000` bit/s.
+
+Replace the interface, node ID, or bitrate in the commands below if your setup
+differs. Only one program should control a CANopen node at a time.
+
+### 1. Clone, build, and source
+
+If the repository is not already in a ROS 2 workspace, clone it into the
+workspace's `src` directory:
 
 ```bash
-cd /path/to/ros2_ws
+mkdir -p ~/ros2_ws/src
+cd ~/ros2_ws/src
+git clone https://github.com/anunthramaswami2030/franka_gripper_control.git
+cd ~/ros2_ws
 rosdep install --from-paths src --ignore-src -r -y
 colcon build --packages-select franka_gripper_control --symlink-install
 source install/setup.bash
 ```
 
-The runtime dependencies are ROS 2 `rclpy`, `trajectory_msgs`, `sensor_msgs`,
-`std_msgs`, `std_srvs`, and Python `python-can`. The host also needs `iproute2`
-to inspect/configure SocketCAN. `can-utils` is optional but useful for
-`candump` during diagnosis.
+If it is already cloned, start with `cd` to the workspace and run the final
+three commands. The runtime dependencies are ROS 2 `rclpy`, `trajectory_msgs`,
+`sensor_msgs`, `std_msgs`, `std_srvs`, and Python `python-can`. The host also
+needs `iproute2` to inspect/configure SocketCAN; `can-utils` is optional but
+useful for diagnosis.
 
-Every new terminal must source both the ROS installation and this workspace
-before using the node or importing the installed package.
+Every new terminal must source the ROS installation and then the workspace's
+`install/setup.bash` before using the node or importing the installed package.
 
-## Configure SocketCAN
+### 2. Bring up the CAN interface
 
-Configure the interface before starting the node. The bitrate must match the
-controller:
+SocketCAN is the Linux interface to a CAN adapter; it exposes the bus as a
+network device such as `can0`. Configure it before starting the node. Every
+device on the physical bus must use the same bitrate:
 
 ```bash
 sudo ip link set can0 down
@@ -135,7 +159,7 @@ live transmit and receive error counters. `ERROR-WARNING`, `ERROR-PASSIVE`, or
 `BUS-OFF` usually indicates a bitrate, wiring, termination, power, or node
 configuration problem.
 
-## Check the connection without moving the motor
+### 3. Check the connection without moving the motor
 
 Stop other software that accesses this CANopen node, then run:
 
@@ -144,6 +168,9 @@ python3 -m franka_gripper_control.check_faulhaber_connection \
   --interface can0 \
   --node-id 1
 ```
+
+Continue only when the final line reports `RESULT: HEALTHY`. The checker reads
+controller state and CAN error counters but does not enable or move the drive.
 
 The checker:
 
@@ -171,7 +198,7 @@ Useful checker options are:
 | `--interval` | `0.5` s | Passive observation time after each sample |
 | `--response-timeout` | `1.0` s | Per-request timeout |
 
-## Quick start with ROS 2
+### 4. Start the ROS node
 
 Create the default calibration directory if this is the first run:
 
@@ -189,7 +216,11 @@ The node first tries to load the existing calibration file and enter CSP. If
 that fails—for example, on first use when the file does not exist—the ROS node
 remains available but ignores trajectories until calibration succeeds.
 
-With the mechanism clear, calibrate from another sourced terminal:
+### 5. Calibrate once
+
+If a valid calibration file already exists for this exact mechanism, skip this
+step. Otherwise, clear the complete gripper travel, keep an emergency stop
+available, and run from another sourced terminal:
 
 ```bash
 ros2 service call \
@@ -204,7 +235,13 @@ Wait for `success: true`. The default launch file saves calibration at:
 ~/.ros/faulhaber_gripper_limits.json
 ```
 
-Publish a two-point test trajectory. ROS joint positions are in **metres**:
+Do not reuse this file for a different gripper or after changing the mechanism.
+
+### 6. Send a first trajectory
+
+Publish a two-point test trajectory from another sourced terminal. ROS joint
+positions are in **metres**, so `0.04` means a 40 mm opening. Replace it with a
+known-safe width if 40 mm is not appropriate for your mechanism:
 
 ```bash
 ros2 topic pub --once \
@@ -212,15 +249,33 @@ ros2 topic pub --once \
   trajectory_msgs/msg/JointTrajectory \
   "{joint_names: [fr3_gripper_width], points: [
     {positions: [0.0], time_from_start: {sec: 0, nanosec: 0}},
-    {positions: [0.08], time_from_start: {sec: 2, nanosec: 0}}
+    {positions: [0.04], time_from_start: {sec: 2, nanosec: 0}}
   ]}"
 ```
 
 For the first accepted trajectory after startup or calibration, the node
 replaces the first point's width with the measured current width. Its timestamp
 is retained, so the second point above produces a smooth two-second motion from
-the physical starting position to `0.08 m`. A one-point first message only
+the physical starting position to `0.04 m`. A one-point first message only
 establishes a hold and therefore does not move the gripper.
+
+Confirm measured width and motor current in separate sourced terminals:
+
+```bash
+ros2 topic echo /faulhaber_gripper/joint_states
+ros2 topic echo /faulhaber_gripper/motor_current_ma
+```
+
+### 7. Shut down
+
+Press `Ctrl+C` in the launch terminal. Normal shutdown stops the CSP scheduler,
+disables the drive, restores temporary PDO mappings and current limits, and
+closes the CAN connection. After the node has exited, the host interface can be
+taken down if desired:
+
+```bash
+sudo ip link set can0 down
+```
 
 ## ROS node API
 
@@ -619,6 +674,37 @@ services and the predefined identifier distribution are introduced on pages
 
 All multi-byte values are little-endian. CAN identifiers are standard 11-bit
 identifiers; no extended frames are used.
+
+### CAN and CANopen glossary
+
+| Term | Brief definition |
+|---|---|
+| CAN | **Controller Area Network**, a shared, differential serial bus. Every device sees every frame; the CAN identifier determines meaning and arbitration priority. |
+| CAN bus | The physical two-wire `CAN_H`/`CAN_L` network shared by the adapter and controllers. A linear bus normally has one 120-ohm terminator at each physical end. |
+| Bitrate | The bus signaling rate in bits per second. All devices must match; this repository defaults to `500000` bit/s. |
+| Frame | One CAN transmission containing an identifier and up to eight payload bytes in Classical CAN. A CAN identifier labels and prioritizes a frame; by itself it is not a source or destination address. |
+| Arbitration | CAN's automatic collision resolution when devices begin transmitting together. A lower numerical identifier has higher priority and continues without corrupting the winning frame. |
+| Remote frame | A CAN frame that requests another device to transmit data with the same identifier. The connection checker uses one for node guarding; motor control uses normal data frames. |
+| SocketCAN | Linux's CAN networking API. It represents a CAN adapter as an interface such as `can0`, which `python-can` opens for this package. |
+| CANopen | A higher-level protocol built on CAN that standardizes device configuration, network management, real-time data exchange, and device profiles. |
+| Node / node ID | One logical CANopen device and its address, normally `1` through `127`. This package defaults to motor-controller node `1`. |
+| COB-ID | **Communication Object Identifier**: the CAN identifier assigned to a CANopen message type. Many predefined COB-IDs are a function-code base plus the node ID. |
+| Object dictionary | The controller's indexed parameter database. An entry such as `0x6041:00` means index `0x6041`, subindex `0`, here the drive Statusword. |
+| SDO | **Service Data Object**, a request/response transfer used to read or write object-dictionary entries. It is suited to setup and diagnostics, not the 200 Hz control loop. CANopen calls a host read from the device an *upload* and a host write to the device a *download*. An *expedited* SDO carries a small value directly in the request or response frame. |
+| SDO command specifier (`CS`) | The first SDO payload byte, which identifies the read/write operation, transferred size, success, or abort response. |
+| PDO | **Process Data Object**, a compact real-time frame whose fields are configured in advance. It omits index metadata on every cycle, reducing bus traffic. |
+| RPDO / TPDO | **Receive PDO** and **Transmit PDO**, named from the controller's perspective. The controller receives command RPDOs and transmits feedback TPDOs. The number, such as RPDO1 or TPDO4, identifies a configured PDO channel. |
+| PDO mapping | The ordered list of object-dictionary fields packed into a PDO payload, including each field's bit length. |
+| SYNC | A broadcast CANopen synchronization frame. Here it tells the controller to apply the staged command RPDO and publish its synchronous feedback TPDO. |
+| NMT | **Network Management**, the CANopen service that starts, stops, resets, and monitors node communication state. |
+| Heartbeat / node guarding | Two ways to monitor whether a node is alive. Heartbeat is periodic transmission by the node; node guarding is a request/reply check initiated by the host. This repository's checker uses node guarding. |
+| EMCY | **Emergency object**, an asynchronous CANopen fault report sent by a controller. The checker observes these without changing drive state. |
+| CiA 402 | The CAN in Automation drive profile defining the motor-drive state machine, Controlword, Statusword, and operating modes. |
+| Controlword / Statusword | CiA 402 bit fields used to request drive-state transitions and report the resulting state or faults. They are not free-form commands or text messages. |
+| CSP | **Cyclic Synchronous Position**, CiA 402 mode 8. The host sends a position target each cycle, synchronized here with CANopen SYNC. |
+| Little-endian | Multi-byte numbers are sent least-significant byte first. For example, `0x6041` appears as bytes `41 60`. |
+| `U8`, `U16`, `U32` / `I16`, `I32` | Unsigned (`U`) or signed (`I`) integers whose suffix gives the number of bits. |
+| `ERROR-ACTIVE` | Normal CAN-controller state. `ERROR-WARNING` and `ERROR-PASSIVE` indicate rising error counters; `BUS-OFF` means the controller disconnected itself after severe repeated errors. |
 
 ### CAN identifiers
 

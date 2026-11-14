@@ -9,6 +9,10 @@ documents state that specifications are subject to change; check FAULHABER's
 official site for a newer revision before applying the information to different
 hardware or firmware.
 
+For short, robotics-oriented definitions of CAN, CANopen, COB-IDs, SDOs, PDOs,
+SYNC, NMT, CiA 402, and CSP, see the main README's
+[CAN and CANopen glossary](../README.md#can-and-canopen-glossary).
+
 ## Included files
 
 | Document | Revision | Pages | SHA-256 |
