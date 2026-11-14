@@ -1,13 +1,21 @@
 #!/usr/bin/env python3
-"""Motor-side lifecycle wrapper for FAULHABER gripper CSP control.
+"""Control a FAULHABER gripper through CANopen CiA 402 and CSP.
 
-This module deliberately contains no ROS dependencies. It contains the tested
-CANopen primitives and presents a small API to the ROS trajectory node:
+This module deliberately has no ROS dependencies.  :class:`FaulhaberDrive`
+implements the CANopen primitives, CiA 402 state transitions, hard-stop
+calibration, and temporary PDO remapping.  :class:`FaulhaberCSPMotor` owns the
+SocketCAN lifecycle and exposes the smaller API used by the ROS node::
 
-    start() -> command_width_mm() / read_feedback() -> stop()
+    start() -> cycle_width_mm() -> stop()
 
-The caller owns scheduling.  Each command stages RPDO1 and emits SYNC; TPDO4
-then supplies statusword, actual position, and motor current.
+The caller owns scheduling.  Each cycle stages a controlword and target
+position in synchronous RPDO1, transmits the standard CANopen SYNC object, and
+then receives statusword, actual position, and motor current in TPDO4.
+
+The CANopen object indices and message layouts follow the FAULHABER CANopen
+Communication / Function Manual, document 7000.05037.  Controller settings
+that are changed temporarily (PDO mappings, operating mode, and current
+limits) are snapshotted and restored during teardown.
 """
 
 from __future__ import annotations
@@ -22,12 +30,34 @@ import can
 
 # FAULHABER CANopen primitives are intentionally defined in this file so the
 # ROS node has exactly one standalone motor-side dependency.
+
+
 class DriveError(RuntimeError):
+    """Report a CANopen response, drive-state, or safety-check failure."""
+
     pass
 
 
 class FaulhaberDrive:
+    """Low-level CANopen and CiA 402 interface for one FAULHABER node.
+
+    Parameters
+    ----------
+    bus : can.BusABC
+        Open python-can bus used for all messages.
+    node_id : int, optional
+        CANopen node ID.  The valid network range is 1 through 127.
+    timeout : float, optional
+        Maximum time in seconds to wait for an SDO response.
+
+    Notes
+    -----
+    This class does not own or close ``bus``.  The higher-level
+    :class:`FaulhaberCSPMotor` owns that lifecycle.
+    """
+
     def __init__(self, bus: can.BusABC, node_id: int = 1, timeout: float = 1.0):
+        """Store the bus and derive the node-specific CANopen COB-IDs."""
         self.bus = bus
         self.node_id = node_id
         self.timeout = timeout
@@ -36,6 +66,7 @@ class FaulhaberDrive:
         self.heartbeat = 0x700 + node_id
 
     def send(self, arbitration_id: int, data: bytes = b"") -> None:
+        """Send one standard 11-bit CAN data frame."""
         self.bus.send(
             can.Message(
                 arbitration_id=arbitration_id,
@@ -45,6 +76,12 @@ class FaulhaberDrive:
         )
 
     def _wait_sdo(self, index: int, subindex: int) -> bytes:
+        """Wait for the matching expedited SDO response.
+
+        Unrelated traffic is ignored.  A boot-up heartbeat is treated as a
+        communication failure because it means the controller reset during
+        the in-flight request.
+        """
         deadline = time.monotonic() + self.timeout
         while time.monotonic() < deadline:
             message = self.bus.recv(deadline - time.monotonic())
@@ -77,6 +114,17 @@ class FaulhaberDrive:
         raise DriveError(f"No SDO response for 0x{index:04X}:{subindex:02X}")
 
     def read(self, index: int, subindex: int = 0, *, signed: bool = False) -> int:
+        """Read a one-to-four-byte object-dictionary value with expedited SDO.
+
+        Parameters
+        ----------
+        index : int
+            16-bit CANopen object index.
+        subindex : int, optional
+            Eight-bit object subindex.
+        signed : bool, optional
+            Interpret the returned little-endian integer as signed.
+        """
         request = bytes((0x40, index & 0xFF, index >> 8, subindex, 0, 0, 0, 0))
         self.send(self.sdo_tx, request)
         response = self._wait_sdo(index, subindex)
@@ -88,18 +136,23 @@ class FaulhaberDrive:
         return int.from_bytes(response[4 : 4 + size], "little", signed=signed)
 
     def write_u8(self, index: int, value: int, subindex: int = 0) -> None:
+        """Write an unsigned eight-bit value with expedited SDO."""
         self._write(index, subindex, 0x2F, struct.pack("<B", value))
 
     def write_u16(self, index: int, value: int, subindex: int = 0) -> None:
+        """Write an unsigned 16-bit value with expedited SDO."""
         self._write(index, subindex, 0x2B, struct.pack("<H", value))
 
     def write_i32(self, index: int, value: int, subindex: int = 0) -> None:
+        """Write a signed 32-bit value with expedited SDO."""
         self._write(index, subindex, 0x23, struct.pack("<i", value))
 
     def write_u32(self, index: int, value: int, subindex: int = 0) -> None:
+        """Write an unsigned 32-bit value with expedited SDO."""
         self._write(index, subindex, 0x23, struct.pack("<I", value))
 
     def _write(self, index: int, subindex: int, command: int, payload: bytes) -> None:
+        """Send an expedited SDO download and verify its acknowledgement."""
         data = bytearray(8)
         data[0] = command
         data[1] = index & 0xFF
@@ -112,13 +165,16 @@ class FaulhaberDrive:
             raise DriveError(f"Unexpected SDO download response 0x{response[0]:02X}")
 
     def statusword(self) -> int:
+        """Read the CiA 402 Statusword object (0x6041)."""
         return self.read(0x6041)
 
     @staticmethod
     def state(statusword: int) -> int:
+        """Mask a statusword down to the CiA 402 finite-state-machine bits."""
         return statusword & 0x006F
 
     def require_state(self, expected: int, label: str) -> int:
+        """Require an exact non-faulted CiA 402 state and return its statusword."""
         status = self.statusword()
         if status & 0x0008:
             raise DriveError(f"Drive fault, statusword 0x{status:04X}")
@@ -130,6 +186,11 @@ class FaulhaberDrive:
         return status
 
     def enable(self) -> None:
+        """Start the CANopen node and reach CiA 402 Operation Enabled.
+
+        Profile Position mode is selected first because calibration uses
+        explicit point-to-point moves before the drive later enters CSP.
+        """
         # NMT Start Remote Node for this node.
         self.send(0x000, bytes((0x01, self.node_id)))
         time.sleep(0.05)
@@ -148,6 +209,21 @@ class FaulhaberDrive:
             self.require_state(expected, label)
 
     def move_relative(self, increments: int, move_timeout: float) -> tuple[int, int]:
+        """Execute one relative Profile Position move.
+
+        Parameters
+        ----------
+        increments : int
+            Signed displacement in the drive's configured user position units.
+        move_timeout : float
+            Maximum seconds to wait for setpoint acknowledgement and target
+            reached bits.
+
+        Returns
+        -------
+        tuple[int, int]
+            Raw position before and after the move.
+        """
         initial = self.read(0x6064, signed=True)
         print(f"Initial position: {initial} increments")
 
@@ -180,7 +256,23 @@ class FaulhaberDrive:
         raise DriveError("Timed out waiting for the target position")
 
     def home_current_position(self, homing_timeout: float) -> int:
-        """Run CiA 402 homing method 35: define current position as zero."""
+        """Run homing method 35 and define the current position as zero.
+
+        Parameters
+        ----------
+        homing_timeout : float
+            Maximum seconds to wait for homing attained.
+
+        Returns
+        -------
+        int
+            Position reported after homing, normally zero.
+
+        Notes
+        -----
+        The drive is returned to Profile Position mode before this method
+        returns.
+        """
         self.write_u8(0x6060, 6)
         if self.read(0x6061, signed=True) != 6:
             raise DriveError("Homing mode did not become active")
@@ -230,7 +322,48 @@ class FaulhaberDrive:
         stall_velocity_rpm: int,
         stall_position_span: int,
     ) -> tuple[int, int]:
-        """Approach one stop and detect sustained current plus stopped motion."""
+        """Approach one mechanical stop with guarded Profile Velocity motion.
+
+        Contact is accepted only when high current and low velocity persist for
+        ``stall_duration`` without significant position progress.  Travel,
+        direction, timeout, and drive-state checks provide independent failure
+        bounds if contact is not detected.
+
+        Parameters
+        ----------
+        direction : int
+            ``1`` for the opening direction or ``-1`` for closing.
+        label : str
+            Human-readable direction used in diagnostics.
+        speed_rpm : int
+            Unsigned approach speed; ``direction`` supplies its sign.
+        current_threshold_ma : int
+            Minimum absolute current indicating mechanical load.
+        stall_duration : float
+            Seconds that the loaded, low-velocity condition must persist.
+        max_travel : int
+            Maximum permitted travel in encoder increments.
+        approach_timeout : float
+            Maximum duration of the complete approach.
+        poll_interval : float
+            Delay between feedback samples.
+        progress_interval : float
+            Delay between progress messages.
+        stall_velocity_rpm : int
+            Largest absolute velocity still considered stopped.
+        stall_position_span : int
+            Maximum encoder motion within one stationary interval.
+
+        Returns
+        -------
+        tuple[int, int]
+            Position and current at confirmed contact.
+
+        Notes
+        -----
+        The target velocity is reset to zero in a ``finally`` block on every
+        exit path.
+        """
         if direction not in {-1, 1}:
             raise ValueError("direction must be -1 or +1")
         speed_rpm = abs(speed_rpm) * direction
@@ -332,7 +465,23 @@ class FaulhaberDrive:
         stall_velocity_rpm: int,
         stall_position_span: int,
     ) -> dict[str, int]:
-        """Find both hard stops twice and return raw and safe absolute limits."""
+        """Measure both hard stops and derive safe absolute travel limits.
+
+        The opening stop is approached twice, then made position zero with
+        homing method 35.  The closing stop is also approached twice; the two
+        measurements must agree within ``repeatability_tolerance``.  An
+        ``endpoint_margin`` is removed from both ends before returning limits.
+
+        Calibration temporarily caps continuous and peak current and lowers
+        acceleration/deceleration.  It never raises an existing controller
+        current limit, and every changed value is restored in ``finally``.
+
+        Returns
+        -------
+        dict[str, int]
+            Raw stop measurements, repeatability, endpoint margin, and the
+            inclusive ``safe_min``/``safe_max`` coordinates used by CSP.
+        """
         original = {
             "continuous_current": self.read(0x2333, 1),
             "peak_current": self.read(0x2333, 2),
@@ -495,7 +644,20 @@ class FaulhaberDrive:
             print("Original current and motion limits restored")
 
     def move_absolute(self, target: int, move_timeout: float) -> tuple[int, int]:
-        """Move to an absolute CiA 402 position coordinate."""
+        """Execute one absolute Profile Position move.
+
+        Parameters
+        ----------
+        target : int
+            Absolute position in configured user units.
+        move_timeout : float
+            Maximum seconds to wait for acknowledgement and target reached.
+
+        Returns
+        -------
+        tuple[int, int]
+            Raw position before and after the move.
+        """
         initial = self.read(0x6064, signed=True)
         self.write_i32(0x607A, target)
 
@@ -527,7 +689,13 @@ class FaulhaberDrive:
         raise DriveError("Timed out waiting for the absolute target")
 
     def snapshot_rpdo1(self) -> dict[str, int | list[int]]:
-        """Read the RPDO1 communication and mapping parameters for restoration."""
+        """Read all RPDO1 settings that CSP temporarily replaces.
+
+        Returns
+        -------
+        dict[str, int | list[int]]
+            COB-ID, transmission type, and active mapping entries.
+        """
         count = self.read(0x1600, 0)
         if count > 8:
             raise DriveError(f"Unexpected RPDO1 mapping count {count}")
@@ -538,7 +706,17 @@ class FaulhaberDrive:
         }
 
     def configure_csp_rpdo1(self) -> dict[str, int | list[int]]:
-        """Temporarily map RPDO1 to controlword + target position, synchronous."""
+        """Map synchronous RPDO1 to Controlword and Target Position.
+
+        The PDO is disabled while object 0x1600 is rebuilt, as required by the
+        CANopen mapping procedure.  Transmission type 1 causes the staged
+        command to execute on every SYNC.
+
+        Returns
+        -------
+        dict[str, int | list[int]]
+            Original configuration for :meth:`restore_rpdo1`.
+        """
         saved = self.snapshot_rpdo1()
         try:
             disabled_cob_id = int(saved["cob_id"]) | 0x80000000
@@ -558,7 +736,7 @@ class FaulhaberDrive:
         return saved
 
     def restore_rpdo1(self, saved: dict[str, int | list[int]]) -> None:
-        """Best-effort restoration of the RPDO1 configuration."""
+        """Restore a configuration returned by :meth:`snapshot_rpdo1`."""
         original_cob_id = int(saved["cob_id"])
         self.write_u32(0x1400, original_cob_id | 0x80000000, 1)
         self.write_u8(0x1600, 0, 0)
@@ -569,7 +747,13 @@ class FaulhaberDrive:
         self.write_u32(0x1400, original_cob_id, 1)
 
     def snapshot_tpdo4(self) -> dict[str, int | list[int]]:
-        """Read TPDO4 communication and mapping parameters for restoration."""
+        """Read all TPDO4 settings that CSP temporarily replaces.
+
+        Returns
+        -------
+        dict[str, int | list[int]]
+            COB-ID, transmission type, and active mapping entries.
+        """
         count = self.read(0x1A03, 0)
         if count > 8:
             raise DriveError(f"Unexpected TPDO4 mapping count {count}")
@@ -580,7 +764,17 @@ class FaulhaberDrive:
         }
 
     def configure_csp_tpdo4(self) -> dict[str, int | list[int]]:
-        """Map synchronous TPDO4 to status, actual position, and current."""
+        """Map synchronous TPDO4 to status, position, and current feedback.
+
+        The eight-byte payload is ``U16 Statusword`` (0x6041), ``I32 Position
+        Actual Value`` (0x6064), and ``I16 Current Actual Value`` (0x6078).
+        Transmission type 1 emits one feedback frame after every SYNC.
+
+        Returns
+        -------
+        dict[str, int | list[int]]
+            Original configuration for :meth:`restore_tpdo4`.
+        """
         saved = self.snapshot_tpdo4()
         try:
             disabled_cob_id = int(saved["cob_id"]) | 0x80000000
@@ -601,7 +795,7 @@ class FaulhaberDrive:
         return saved
 
     def restore_tpdo4(self, saved: dict[str, int | list[int]]) -> None:
-        """Best-effort restoration of the TPDO4 configuration."""
+        """Restore a configuration returned by :meth:`snapshot_tpdo4`."""
         original_cob_id = int(saved["cob_id"])
         self.write_u32(0x1803, original_cob_id | 0x80000000, 1)
         self.write_u8(0x1A03, 0, 0)
@@ -616,7 +810,17 @@ class FaulhaberDrive:
     ) -> tuple[
         dict[str, int | list[int]], dict[str, int | list[int]], int
     ]:
-        """Initialize CSP, configure command/feedback PDOs, and re-enable."""
+        """Configure PDOs and enter Cyclic Synchronous Position mode.
+
+        The current position is written as the first target before the drive is
+        re-enabled, preventing an initial setpoint jump.
+
+        Returns
+        -------
+        tuple[dict, dict, int]
+            Saved RPDO1 settings, saved TPDO4 settings, and the initial raw
+            position to hold on the first CSP cycle.
+        """
         self.write_u16(0x6040, 0x0000)
         time.sleep(0.05)
         current_position = self.read(0x6064, signed=True)
@@ -649,13 +853,28 @@ class FaulhaberDrive:
         return saved_rpdo1, saved_tpdo4, current_position
 
     def send_csp_target(self, raw_target: int) -> None:
-        """Stage one synchronous RPDO1 target and apply it with CANopen SYNC."""
+        """Stage one RPDO1 target and apply it with the CANopen SYNC object.
+
+        RPDO1 uses COB-ID ``0x200 + node_id``.  The following zero-length frame
+        on COB-ID 0x080 is the standard SYNC trigger; it also causes the
+        configured TPDO4 feedback sample to be transmitted.
+        """
         payload = struct.pack("<Hi", 0x000F, raw_target)
         self.send(0x200 + self.node_id, payload)
         self.send(0x080)
 
     def read_csp_tpdo4(self, timeout: float) -> tuple[int, int, int]:
-        """Receive one synchronous TPDO4: statusword, position, current."""
+        """Receive and unpack one synchronous TPDO4 feedback frame.
+
+        Unrelated CAN traffic is ignored, while a controller boot-up message
+        fails immediately because the drive state and temporary mapping were
+        lost.
+
+        Returns
+        -------
+        tuple[int, int, int]
+            Statusword, signed raw position, and signed current in mA.
+        """
         deadline = time.monotonic() + timeout
         cob_id = 0x480 + self.node_id
         while time.monotonic() < deadline:
@@ -677,25 +896,58 @@ class FaulhaberDrive:
         self.write_u16(0x6040, 0x0002)
 
     def disable(self) -> None:
+        """Disable drive voltage through the CiA 402 Controlword."""
         self.write_u16(0x6040, 0x0000)
 
 
 def raw_to_width_mm(raw_position: int, limits: dict[str, int | float]) -> float:
-    """Map raw motor coordinates to gripper opening width in millimetres."""
+    """Map a calibrated motor coordinate to gripper opening width.
+
+    ``safe_min`` corresponds to 0 mm (closed) and ``safe_max`` corresponds to
+    ``max_width_mm`` (open).
+    """
     raw_span = limits["safe_max"] - limits["safe_min"]
     return (raw_position - limits["safe_min"]) * limits["max_width_mm"] / raw_span
 
 
 def width_mm_to_raw_position(width_mm: float, limits: dict[str, int | float]) -> int:
-    """Map gripper opening width in millimetres to raw motor coordinates."""
+    """Map gripper opening width to the nearest calibrated motor coordinate."""
     raw_span = limits["safe_max"] - limits["safe_min"]
     return int(round(limits["safe_min"] + width_mm * raw_span / limits["max_width_mm"]))
 
 
-
-
 @dataclass(frozen=True)
 class CalibrationOptions:
+    """Safety and detection settings for hard-stop calibration.
+
+    Attributes
+    ----------
+    current_limit_ma : int
+        Maximum temporary continuous and peak current.
+    stall_current_ma : int
+        Absolute current threshold used as one contact condition.
+    first_speed_rpm, second_speed_rpm : int
+        Speeds for the coarse and repeatability approaches.
+    backoff_increments : int
+        Distance moved away between repeated stop approaches.
+    stall_duration : float
+        Required duration of sustained loaded, low-velocity feedback.
+    max_open_travel, max_close_travel : int
+        Independent travel bounds for the two approach directions.
+    homing_timeout : float
+        Timeout for each calibration move or approach.
+    poll_interval, progress_interval : float
+        Feedback polling and console reporting periods in seconds.
+    repeatability_tolerance : int
+        Maximum difference between repeated closed-stop measurements.
+    endpoint_margin : int
+        Encoder increments excluded from each mechanical endpoint.
+    stall_velocity_rpm, stall_position_span : int
+        Velocity and position-motion thresholds for confirming a stall.
+    max_width_mm : float
+        Physical opening assigned to the calibrated safe travel.
+    """
+
     current_limit_ma: int = 300
     stall_current_ma: int = 220
     first_speed_rpm: int = 40
@@ -716,12 +968,37 @@ class CalibrationOptions:
 
 @dataclass(frozen=True)
 class CSPOptions:
+    """Runtime limits for Cyclic Synchronous Position control.
+
+    Attributes
+    ----------
+    current_limit_ma : int
+        Requested temporary CSP current limit.  The stored drive limits remain
+        an upper bound.
+    feedback_timeout_ms : float
+        Maximum wait for TPDO4 after each SYNC.
+    """
+
     current_limit_ma: int = 400
     feedback_timeout_ms: float = 4.0
 
 
 @dataclass(frozen=True)
 class Feedback:
+    """One synchronous motor feedback sample.
+
+    Attributes
+    ----------
+    statusword : int
+        Raw CiA 402 Statusword.
+    raw_position : int
+        Signed position in the drive's configured user units.
+    width_mm : float
+        Position converted through the saved gripper calibration.
+    current_ma : int
+        Signed motor current in milliamperes.
+    """
+
     statusword: int
     raw_position: int
     width_mm: float
@@ -729,7 +1006,29 @@ class Feedback:
 
 
 class FaulhaberCSPMotor:
-    """Own the SocketCAN bus, calibration, PDO mappings, and safe teardown."""
+    """Own the SocketCAN connection, calibration, CSP setup, and teardown.
+
+    Parameters
+    ----------
+    interface : str, optional
+        SocketCAN interface name, such as ``can0``.
+    node_id : int, optional
+        CANopen node ID from 1 through 127.
+    calibration : CalibrationOptions | None, optional
+        Hard-stop calibration settings.
+    csp : CSPOptions | None, optional
+        Runtime CSP current and feedback settings.
+    calibration_path : pathlib.Path | str, optional
+        JSON file from which safe travel limits are loaded or to which a new
+        calibration is written.
+    recalibrate : bool, optional
+        Calibrate during :meth:`start` instead of loading the JSON file.
+
+    Notes
+    -----
+    Call :meth:`stop` even after a failed :meth:`start`.  ``start`` already
+    does this internally, and repeated ``stop`` calls are safe.
+    """
 
     def __init__(
         self,
@@ -741,6 +1040,7 @@ class FaulhaberCSPMotor:
         calibration_path: Path | str = "faulhaber_gripper_limits.json",
         recalibrate: bool = True,
     ) -> None:
+        """Store configuration and initialize a disconnected lifecycle."""
         if not 1 <= node_id <= 127:
             raise ValueError("node_id must be from 1 through 127")
         self.interface = interface
@@ -761,11 +1061,13 @@ class FaulhaberCSPMotor:
         self._started = False
 
     def _require_drive(self) -> FaulhaberDrive:
+        """Return the open low-level drive or fail with a lifecycle error."""
         if self.drive is None:
             raise DriveError("Motor connection is not open")
         return self.drive
 
     def _load_calibration(self) -> dict[str, int | float]:
+        """Load and minimally validate calibrated travel limits from JSON."""
         record = json.loads(self.calibration_path.read_text(encoding="utf-8"))
         required = {"safe_min", "safe_max", "max_width_mm"}
         missing = required.difference(record)
@@ -780,6 +1082,7 @@ class FaulhaberCSPMotor:
         return record
 
     def _calibrate(self) -> dict[str, int | float]:
+        """Run hard-stop calibration, add metadata, and save it as JSON."""
         drive = self._require_drive()
         cfg = self.calibration_options
         limits: dict[str, int | float] = drive.calibrate_hard_stops(
@@ -813,7 +1116,17 @@ class FaulhaberCSPMotor:
         return record
 
     def start(self) -> Feedback:
-        """Connect, calibrate/load limits, enter CSP, and return initial feedback."""
+        """Connect, obtain limits, enter CSP, and return initial feedback.
+
+        Existing continuous and peak current limits are treated as hard upper
+        bounds.  The drive's operating mode, PDO mappings, and current limits
+        are saved before temporary CSP configuration.
+
+        Returns
+        -------
+        Feedback
+            First synchronous sample while holding the startup position.
+        """
         if self._started:
             raise DriveError("Motor is already started")
         self.bus = can.Bus(interface="socketcan", channel=self.interface)
@@ -857,7 +1170,13 @@ class FaulhaberCSPMotor:
             raise
 
     def calibrate_and_restart(self) -> Feedback:
-        """Leave CSP, calibrate both hard stops, save limits, and re-enter CSP."""
+        """Leave CSP, calibrate both stops, save limits, and re-enter CSP.
+
+        Returns
+        -------
+        Feedback
+            First synchronous sample after calibration.
+        """
         self.stop(quick=False)
         previous = self.recalibrate
         self.recalibrate = True
@@ -868,9 +1187,18 @@ class FaulhaberCSPMotor:
 
     @property
     def started(self) -> bool:
+        """Whether CSP setup completed and commands may be sent."""
         return self._started
 
     def command_raw(self, raw_target: int) -> None:
+        """Send one calibrated raw position target and SYNC.
+
+        Raises
+        ------
+        DriveError
+            If the motor is stopped or the target is outside the calibrated
+            safe interval.
+        """
         if not self._started or self.limits is None:
             raise DriveError("CSP motor has not been started")
         safe_min = int(self.limits["safe_min"])
@@ -882,6 +1210,13 @@ class FaulhaberCSPMotor:
         self._require_drive().send_csp_target(raw_target)
 
     def command_width_mm(self, width_mm: float) -> None:
+        """Convert and send one physical gripper-width target.
+
+        Parameters
+        ----------
+        width_mm : float
+            Gripper opening between zero and the calibrated maximum.
+        """
         if self.limits is None:
             raise DriveError("No calibration is available")
         maximum = float(self.limits["max_width_mm"])
@@ -892,6 +1227,7 @@ class FaulhaberCSPMotor:
         self.command_raw(width_mm_to_raw_position(width_mm, self.limits))
 
     def read_feedback(self) -> Feedback:
+        """Read one TPDO4 sample and require Operation Enabled state."""
         if not self._started or self.limits is None:
             raise DriveError("CSP motor has not been started")
         status, raw, current = self._require_drive().read_csp_tpdo4(
@@ -909,11 +1245,25 @@ class FaulhaberCSPMotor:
         )
 
     def cycle_width_mm(self, width_mm: float) -> Feedback:
+        """Perform one width-command/SYNC/feedback CSP transaction."""
         self.command_width_mm(width_mm)
         return self.read_feedback()
 
     def stop(self, *, quick: bool = False) -> None:
-        """Best-effort stop and exact restoration of temporary drive settings."""
+        """Stop motion, restore temporary settings, and close SocketCAN.
+
+        Parameters
+        ----------
+        quick : bool, optional
+            Request CiA 402 Quick Stop before disabling the drive.  This is
+            used for control-loop or startup failures.
+
+        Notes
+        -----
+        Teardown is deliberately best-effort: failure to restore one setting
+        is reported but does not prevent subsequent restoration and bus
+        closure.
+        """
         drive = self.drive
         if drive is not None:
             if quick:

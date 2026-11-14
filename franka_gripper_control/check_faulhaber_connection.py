@@ -1,8 +1,16 @@
 #!/usr/bin/env python3
-"""Read-only health check for a FAULHABER CANopen motor controller.
+"""Perform a non-moving health check of a FAULHABER CANopen controller.
 
-The script never changes NMT state, CiA 402 state, operating mode, or target.
-It sends only node-guard remote requests and SDO upload (read) requests.
+The check combines Linux SocketCAN link statistics with CANopen node guarding,
+expedited SDO uploads, CiA 402 state decoding, and passive observation of
+boot-up, emergency, and CAN error frames.  Interface counters are compared
+before and after the sample window so errors generated during the check are not
+hidden by an initially healthy state.
+
+The script is intentionally read-only with respect to the controller: it never
+sends an NMT state command, Controlword, mode selection, PDO, SYNC, or motion
+target.  Its only outbound frames are node-guard remote requests and SDO upload
+(read) requests.
 """
 
 from __future__ import annotations
@@ -18,6 +26,22 @@ import can
 
 @dataclass
 class LinkState:
+    """Relevant state parsed from ``ip -details -statistics link``.
+
+    Attributes
+    ----------
+    text : str
+        Complete command output retained for diagnostics.
+    can_state : str | None
+        Kernel CAN state, normally ``ERROR-ACTIVE`` for a healthy interface.
+    tx_error, rx_error : int | None
+        Live CAN transmit and receive error counters.
+    bus_errors, bus_off : int | None
+        Cumulative kernel bus-error and bus-off counters.
+
+    ``None`` means the installed ``ip`` output did not expose the field.
+    """
+
     text: str
     can_state: str | None
     tx_error: int | None
@@ -27,10 +51,29 @@ class LinkState:
 
 
 class CheckError(RuntimeError):
+    """Report an interface inspection or CANopen response failure."""
+
     pass
 
 
 def read_link_state(interface: str) -> LinkState:
+    """Inspect one SocketCAN network interface without changing it.
+
+    Parameters
+    ----------
+    interface : str
+        Linux SocketCAN interface name, for example ``can0``.
+
+    Returns
+    -------
+    LinkState
+        Parsed live and cumulative error state.
+
+    Raises
+    ------
+    CheckError
+        If the interface cannot be inspected.
+    """
     result = subprocess.run(
         ["ip", "-details", "-statistics", "link", "show", interface],
         check=False,
@@ -60,7 +103,23 @@ def read_link_state(interface: str) -> LinkState:
 
 
 class ReadOnlyCanopen:
+    """Issue only CANopen node-guard and SDO-upload requests.
+
+    Parameters
+    ----------
+    bus : can.BusABC
+        Open python-can bus.
+    node_id : int
+        Target CANopen node ID.
+    timeout : float
+        Per-request response timeout in seconds.
+
+    The class also records asynchronous boot-up, EMCY, and CAN error frames
+    encountered while waiting for requested responses or draining the bus.
+    """
+
     def __init__(self, bus: can.BusABC, node_id: int, timeout: float):
+        """Derive standard node-specific COB-IDs and reset observations."""
         self.bus = bus
         self.node_id = node_id
         self.timeout = timeout
@@ -73,6 +132,7 @@ class ReadOnlyCanopen:
         self.error_frames = 0
 
     def _send(self, arbitration_id: int, data: bytes = b"", *, remote: bool = False) -> None:
+        """Send one standard data or remote CAN frame."""
         self.bus.send(
             can.Message(
                 arbitration_id=arbitration_id,
@@ -83,6 +143,7 @@ class ReadOnlyCanopen:
         )
 
     def _record_async(self, message: can.Message) -> None:
+        """Record error, boot-up, and emergency frames for final assessment."""
         if message.is_error_frame:
             self.error_frames += 1
             return
@@ -94,6 +155,7 @@ class ReadOnlyCanopen:
             self.emergencies.append((code, data))
 
     def _receive_until(self, predicate, deadline: float) -> can.Message:
+        """Return the first matching frame while recording other traffic."""
         while time.monotonic() < deadline:
             message = self.bus.recv(max(0.0, deadline - time.monotonic()))
             if message is None:
@@ -104,6 +166,14 @@ class ReadOnlyCanopen:
         raise CheckError("Timed out waiting for CANopen response")
 
     def node_guard(self) -> tuple[int, float]:
+        """Request the node's current NMT state with a guarding remote frame.
+
+        Returns
+        -------
+        tuple[int, float]
+            Seven-bit NMT state and round-trip latency in milliseconds.  The
+            protocol's alternating toggle bit is masked out.
+        """
         started = time.monotonic()
         self._send(self.heartbeat_id, remote=True)
         message = self._receive_until(
@@ -121,6 +191,22 @@ class ReadOnlyCanopen:
     def sdo_read(
         self, index: int, subindex: int = 0, *, signed: bool = False
     ) -> tuple[int, float]:
+        """Read a scalar object-dictionary entry with expedited SDO upload.
+
+        Parameters
+        ----------
+        index : int
+            16-bit CANopen object index.
+        subindex : int, optional
+            Eight-bit object subindex.
+        signed : bool, optional
+            Interpret the little-endian payload as signed.
+
+        Returns
+        -------
+        tuple[int, float]
+            Decoded value and round-trip latency in milliseconds.
+        """
         request = bytes((0x40, index & 0xFF, index >> 8, subindex, 0, 0, 0, 0))
         started = time.monotonic()
         self._send(self.sdo_request_id, request)
@@ -151,6 +237,7 @@ class ReadOnlyCanopen:
         return value, (time.monotonic() - started) * 1000.0
 
     def drain(self, duration: float) -> None:
+        """Passively observe asynchronous traffic for ``duration`` seconds."""
         deadline = time.monotonic() + duration
         while time.monotonic() < deadline:
             message = self.bus.recv(min(0.05, deadline - time.monotonic()))
@@ -167,6 +254,7 @@ NMT_NAMES = {
 
 
 def cia402_state(statusword: int) -> str:
+    """Decode the finite-state-machine bits of a CiA 402 Statusword."""
     masked = statusword & 0x006F
     return {
         0x0000: "Not ready to switch on",
@@ -181,6 +269,14 @@ def cia402_state(statusword: int) -> str:
 
 
 def main() -> int:
+    """Run the read-only link/controller check and return a process status.
+
+    Returns
+    -------
+    int
+        Zero only if the interface, controller responses, drive status, and
+        before/after CAN error counters all pass; otherwise one.
+    """
     parser = argparse.ArgumentParser(description="Read-only FAULHABER CANopen health check")
     parser.add_argument("--interface", default="can0")
     parser.add_argument("--node-id", type=int, default=1)
@@ -230,6 +326,8 @@ def main() -> int:
             except CheckError as error:
                 failures.append(f"Node guarding: {error}")
 
+            # These standard and manufacturer-independent CiA 402 objects
+            # characterize the controller without changing its state.
             reads = (
                 ("Device type", 0x1000, 0, False),
                 ("Statusword", 0x6041, 0, False),

@@ -1,94 +1,195 @@
-# FAULHABER Gripper Trajectory Node
+# FAULHABER Gripper Control
 
-This ROS 2 node controls a FAULHABER-driven gripper over CANopen using Cyclic
-Synchronous Position (CSP) mode. It receives timestamped gripper-width
-trajectories, linearly interpolates between their waypoints at 200 Hz by
-default, and commands the gripper in millimetres.
+This ROS 2 package controls a FAULHABER-driven gripper over CANopen. It provides:
 
-The user-facing width convention is:
+- a ROS 2 node that accepts timestamped `JointTrajectory` chunks and tracks them
+  in Cyclic Synchronous Position (CSP) mode;
+- a ROS-independent Python API for applications that want to control the motor
+  directly;
+- repeatable mechanical hard-stop calibration with persistent travel limits;
+- measured width, motor current, and waypoint tracking-error telemetry; and
+- a read-only connection checker for diagnosing SocketCAN and CANopen without
+  enabling or moving the drive.
 
-- `0.0 mm`: fully closed calibrated endpoint
-- `105.0 mm`: fully open calibrated endpoint
+The user-facing gripper convention is:
 
-The node starts CSP using an existing calibration file. If calibration has not
-yet been performed, the node remains alive with motor tracking disabled so the
-calibration service can be called.
+| Quantity | Convention |
+|---|---|
+| Closed width | `0.0 mm` in the Python API, `0.0 m` in ROS |
+| Open width | `max_width_mm`, `81.2 mm` by default |
+| Raw closed coordinate | Calibrated `safe_min` |
+| Raw open coordinate | Calibrated `safe_max` |
 
-## ROS interfaces
+The package directly owns the SocketCAN bus and the drive state. It is not a
+`ros2_control` hardware interface and should not run concurrently with another
+program that sends CANopen commands to the same node.
 
-### Subscribed topic
+> [!CAUTION]
+> Calibration intentionally drives the mechanism into both mechanical hard
+> stops. Clear the gripper, use conservative current/travel limits, keep an
+> emergency stop available, and supervise the complete calibration. Verify the
+> wiring and supply requirements against the datasheet for the exact motor
+> variant before applying power.
 
-| Topic | Type | Units | Description |
-|---|---|---|---|
-| `/polyumi/target_gripper` | `trajectory_msgs/msg/JointTrajectory` | metres in `positions` | Timestamped trajectory chunks containing the `fr3_gripper_width` joint. |
-
-Each trajectory point's execution time is:
+## Architecture
 
 ```text
-message.header.stamp + point.time_from_start
+JointTrajectory publisher
+          |
+          v
+ROS callback: validate, convert metres -> millimetres, merge trajectory chunks
+          |
+          v
+Thread-safe waypoint buffer <---- ROS time / simulated time
+          |
+          v
+200 Hz CSP worker -------------> monotonic scheduling and lateness checks
+          |
+          v
+FaulhaberCSPMotor: limits, calibration conversion, lifecycle, safe teardown
+          |
+          v
+python-can / SocketCAN ---- CANopen RPDO + SYNC / TPDO feedback ---- Drive
+          ^                                                        |
+          +------ statusword, position, and motor current ----------+
 ```
 
-If `header.stamp` is zero, receipt time is used. The joint position supplied by
-ROS is converted from metres to millimetres internally. Times in a message must
-be strictly increasing.
+ROS callbacks never send CSP traffic. A dedicated worker thread performs one
+command/SYNC/feedback exchange per cycle, keeping executor latency out of the
+motor schedule. The ROS clock selects the desired point in the trajectory;
+monotonic time controls the actual loop period.
 
-The first received trajectory begins from the gripper's current measured
-width, preventing an initial jump to the recorded starting position. New chunks
-replace overlapping future waypoints while retaining older non-overlapping
-points.
+## Hardware and software assumptions
 
-### Published topics
+The current configuration assumes:
 
-| Topic | Type | Rate | Units | Description |
-|---|---|---:|---|---|
-| `/faulhaber_gripper/joint_states` | `sensor_msgs/msg/JointState` | CSP rate, default 200 Hz | metres | Measured gripper width in `position[0]`, named `fr3_gripper_width`. `velocity` and `effort` are intentionally empty. |
-| `/faulhaber_gripper/motor_current_ma` | `std_msgs/msg/Float64` | CSP rate, default 200 Hz | mA | Measured motor current. This is not placed in `JointState.effort`. |
-| `/faulhaber_gripper/waypoint_tracking_error_mm` | `std_msgs/msg/Float64` | At source waypoints only | mm | Desired source-waypoint width minus measured width when that waypoint time is crossed. Interpolated CSP samples do not generate error messages. |
+- a FAULHABER controller supporting CANopen CiA 402 and CSP mode 8
+  ([CANopen manual, p. 45](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=45));
+- an 11-bit Classical CAN network at `500000` bit/s;
+- CANopen node ID `1` by default;
+- a Linux SocketCAN interface named `can0` by default; and
+- a gripper whose encoder position changes monotonically across its stroke.
 
-### Service
+For the referenced `2250 ... BX4 IMC RS/CO` hardware, the product datasheet
+identifies connection 7 as `CAN_L`, connection 8 as `CAN_H`, and connection 3
+as `GND`
+([motor datasheet, p. 2](docs/EN_2250_BX4_IMC_RSCO_DFF.pdf#page=2)). Power
+connections differ between product options, so use the full product designation
+and its connection table rather than assuming a supply pinout. Follow normal
+CAN wiring practice, including a twisted pair and 120-ohm termination at both
+physical ends of the bus.
 
-| Service | Type | Description |
-|---|---|---|
-| `/faulhaber_gripper/calibrate` | `std_srvs/srv/Trigger` | Stops tracking, detects both mechanical hard stops twice, saves the calibration, restarts CSP, and holds the resulting current position. |
+The CANopen implementation follows the *FAULHABER Communication / Function
+Manual CANopen BLDC*, document 7000.05037
+([bundled manual](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf)).
+Object availability and electrical connections must still be checked for the
+exact controller firmware and motor variant.
 
-Calibration physically moves the mechanism to both hard stops. Clear the
-mechanism and supervise the gripper before calling the service.
+## Bundled vendor documentation
 
-## Launching
+The exact vendor revisions used to document this implementation are stored in
+[`docs/`](docs/README.md):
 
-Build and source the workspace:
+- [CANopen Communication / Function Manual 7000.05037](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf),
+  2nd edition, 2018-11-09; and
+- [2250 ... BX4 IMC RS/CO product datasheet](docs/EN_2250_BX4_IMC_RSCO_DFF.pdf),
+  2026-07-28 edition.
+
+Inline citations below link to the first relevant PDF page. The
+[`docs` index](docs/README.md) contains a page map and SHA-256 checksum for each
+unchanged source document.
+
+## Build and install
+
+Install the ROS dependencies for the workspace, then build the package:
 
 ```bash
-cd ~/research/ros2_ws
+cd /path/to/ros2_ws
+rosdep install --from-paths src --ignore-src -r -y
 colcon build --packages-select franka_gripper_control --symlink-install
 source install/setup.bash
 ```
 
-Start the node with wall-clock time:
+The runtime dependencies are ROS 2 `rclpy`, `trajectory_msgs`, `sensor_msgs`,
+`std_msgs`, `std_srvs`, and Python `python-can`. The host also needs `iproute2`
+to inspect/configure SocketCAN. `can-utils` is optional but useful for
+`candump` during diagnosis.
+
+Every new terminal must source both the ROS installation and this workspace
+before using the node or importing the installed package.
+
+## Configure SocketCAN
+
+Configure the interface before starting the node. The bitrate must match the
+controller:
+
+```bash
+sudo ip link set can0 down
+sudo ip link set can0 type can bitrate 500000
+sudo ip link set can0 up
+ip -details -statistics link show can0
+```
+
+A healthy idle interface normally reports `can state ERROR-ACTIVE` with zero
+live transmit and receive error counters. `ERROR-WARNING`, `ERROR-PASSIVE`, or
+`BUS-OFF` usually indicates a bitrate, wiring, termination, power, or node
+configuration problem.
+
+## Check the connection without moving the motor
+
+Stop other software that accesses this CANopen node, then run:
+
+```bash
+python3 -m franka_gripper_control.check_faulhaber_connection \
+  --interface can0 \
+  --node-id 1
+```
+
+The checker:
+
+1. records the kernel CAN state and error counters;
+2. sends a node-guard remote request
+   ([CANopen manual, pp. 30–31](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=30));
+3. reads device type, statusword, active mode, position, velocity, and current
+   with expedited SDO uploads
+   ([CANopen manual, pp. 22–24](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=22));
+4. passively observes boot-up, emergency, and CAN error frames
+   ([CANopen manual, pp. 25–26](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=25)); and
+5. verifies that kernel error counters did not increase.
+
+It does **not** send NMT state changes, Controlwords, mode writes, PDOs, SYNC,
+or motion targets. A healthy result verifies communication; it does not verify
+that motion is mechanically safe.
+
+Useful checker options are:
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--interface` | `can0` | SocketCAN interface |
+| `--node-id` | `1` | CANopen node ID, from 1 through 127 |
+| `--samples` | `10` | Number of statusword samples |
+| `--interval` | `0.5` s | Passive observation time after each sample |
+| `--response-timeout` | `1.0` s | Per-request timeout |
+
+## Quick start with ROS 2
+
+Create the default calibration directory if this is the first run:
+
+```bash
+mkdir -p ~/.ros
+```
+
+Start the node with the normal ROS clock:
 
 ```bash
 ros2 launch franka_gripper_control faulhaber_gripper.launch.xml
 ```
 
-For rosbag playback, start the node with simulated time:
+The node first tries to load the existing calibration file and enter CSP. If
+that fails—for example, on first use when the file does not exist—the ROS node
+remains available but ignores trajectories until calibration succeeds.
 
-```bash
-ros2 launch franka_gripper_control faulhaber_gripper.launch.xml \
-  use_sim_time:=true
-```
-
-Then play the unzipped rosbag directory in another sourced terminal:
-
-```bash
-ros2 bag play /path/to/rosbag_directory --clock 200
-```
-
-For live publishers that use the normal system ROS clock, leave
-`use_sim_time:=false` (the default).
-
-## Calling the calibration service
-
-With the mechanism clear:
+With the mechanism clear, calibrate from another sourced terminal:
 
 ```bash
 ros2 service call \
@@ -97,107 +198,204 @@ ros2 service call \
   "{}"
 ```
 
-Wait for a successful response before publishing trajectories. Calibration is
-saved by default to:
+Wait for `success: true`. The default launch file saves calibration at:
 
 ```text
 ~/.ros/faulhaber_gripper_limits.json
 ```
 
-At later startups, the node loads this file and starts at the gripper's current
-physical width without recalibrating.
+Publish a two-point test trajectory. ROS joint positions are in **metres**:
 
-## Launch arguments
+```bash
+ros2 topic pub --once \
+  /polyumi/target_gripper \
+  trajectory_msgs/msg/JointTrajectory \
+  "{joint_names: [fr3_gripper_width], points: [
+    {positions: [0.0], time_from_start: {sec: 0, nanosec: 0}},
+    {positions: [0.08], time_from_start: {sec: 2, nanosec: 0}}
+  ]}"
+```
 
-These are XML launch arguments passed to the node's command-line parser. Except
-for `use_sim_time`, they are not ROS parameters and therefore must be placed
-before or as launch `name:=value` overrides—not after `--ros-args -p`.
+For the first accepted trajectory after startup or calibration, the node
+replaces the first point's width with the measured current width. Its timestamp
+is retained, so the second point above produces a smooth two-second motion from
+the physical starting position to `0.08 m`. A one-point first message only
+establishes a hold and therefore does not move the gripper.
 
-### ROS and CAN configuration
+## ROS node API
 
-| Argument | Default | Meaning |
-|---|---:|---|
-| `use_sim_time` | `false` | Use the ROS `/clock` topic. Enable for rosbag playback with `--clock`. |
-| `interface` | `can0` | SocketCAN interface connected to the motor controller. |
-| `node_id` | `1` | CANopen node ID, valid range 1–127. |
-| `topic` | `/polyumi/target_gripper` | Input `JointTrajectory` topic. |
-| `joint_name` | `fr3_gripper_width` | Joint selected from each trajectory and published in `JointState`. |
-| `calibration_file` | `~/.ros/faulhaber_gripper_limits.json` | Persistent hard-stop calibration file. |
-| `calibration_service` | `/faulhaber_gripper/calibrate` | Calibration service name. |
+### Subscribed topic
 
-### Calibration configuration
+| Default topic | Type | Units | Description |
+|---|---|---|---|
+| `/polyumi/target_gripper` | `trajectory_msgs/msg/JointTrajectory` | metres in `positions` | Timestamped chunks containing the configured `fr3_gripper_width` joint |
 
-| Argument | Default | Units | Meaning |
-|---|---:|---:|---|
-| `first_speed_rpm` | `60` | motor rpm | Speed of the first approach to each hard stop. |
-| `second_speed_rpm` | `10` | motor rpm | Slower verification approach after backing away. |
-| `current_limit_ma` | `300` | mA | Temporary motor-current limit used during calibration. |
-| `stall_current_ma` | `220` | mA | Current threshold used as one condition for hard-stop detection; it must be below `current_limit_ma`. |
-| `max_open_travel` | `1000000` | increments | Maximum positive travel allowed while searching for the open stop. |
-| `max_close_travel` | `2000000` | increments | Maximum negative travel allowed while searching for the closed stop. |
-| `homing_timeout` | `180` | s | Maximum time allowed for each hard-stop approach. |
+The execution time of each point is:
 
-The travel settings are safety bounds, not commanded movements. Use the
-smallest limits known to cover the real mechanism stroke.
+```text
+message.header.stamp + point.time_from_start
+```
 
-### CSP tracking configuration
+If `header.stamp` is zero, receipt time is used as the header time. The callback
+selects only the configured joint; velocity, acceleration, and effort fields in
+the message are ignored.
 
-| Argument | Default | Units | Meaning |
-|---|---:|---:|---|
-| `csp_current_limit_ma` | `400` | mA | Motor-current limit while tracking trajectories. Contact may create persistent position error while this limit protects the mechanism. |
-| `csp_rate_hz` | `200` | Hz | Interpolation, command, and feedback cycle frequency. Width and current are published at this rate. |
-| `delay_compensation_ms` | `13.3` | ms | Fixed look-ahead applied when sampling the buffered trajectory to compensate for measured tracking delay. Requires future waypoints to be available. |
-| `max_tracking_error_mm` | `0` | mm | Following-error shutdown threshold. `0` disables the shutdown, which permits expected error during object contact. |
-| `max_command_speed_rpm` | `4000` | motor rpm | Rejects incoming trajectory segments whose estimated motor speed exceeds this validation limit. It does not command this speed. |
+An incoming chunk is accepted only when:
 
-### Output topic configuration
+- it contains the configured joint and at least one point;
+- every selected position is finite;
+- point times are strictly increasing;
+- every finite width has been clamped into `[0, max_width_mm]`; and
+- each segment's estimated motor speed is below
+  `max_command_speed_rpm`.
 
-| Argument | Default | Meaning |
+Out-of-range finite widths are clamped with a throttled warning. Structural,
+non-finite, timestamp, and speed-validation failures reject the complete
+message; the worker never receives a partially accepted trajectory.
+
+New receding-horizon chunks replace buffered points at or after the new
+chunk's first timestamp. Older, non-overlapping points are retained. If a new
+chunk arrives after the old plan ended but begins in the future, the node
+inserts a synthetic hold at receipt time rather than interpolating through a
+period in which the new plan was unknown. Before the first point and after the
+last point, endpoint widths are held.
+
+### Published topics
+
+| Default topic | Type | Rate | Units | Description |
+|---|---|---:|---|---|
+| `/faulhaber_gripper/joint_states` | `sensor_msgs/msg/JointState` | CSP rate | metres | Measured opening in `position[0]`; `velocity` and `effort` are empty |
+| `/faulhaber_gripper/motor_current_ma` | `std_msgs/msg/Float64` | CSP rate | mA | Signed measured motor current; it is not joint effort |
+| `/faulhaber_gripper/waypoint_tracking_error_mm` | `std_msgs/msg/Float64` | At source waypoints | mm | Desired source width minus measured width when a waypoint time is crossed |
+
+The `JointState.name` entry is the configured joint name. Synthetic points and
+interpolated CSP samples do not produce waypoint-error messages.
+
+### Calibration service
+
+| Default service | Type | Description |
 |---|---|---|
-| `joint_state_topic` | `/faulhaber_gripper/joint_states` | Measured-width topic. |
-| `current_topic` | `/faulhaber_gripper/motor_current_ma` | Motor-current topic. |
-| `waypoint_error_topic` | `/faulhaber_gripper/waypoint_tracking_error_mm` | Source-waypoint tracking-error topic. |
+| `/faulhaber_gripper/calibrate` | `std_srvs/srv/Trigger` | Stop tracking, find both stops, save limits, re-enter CSP, and hold position |
 
-List all launch arguments and their descriptions with:
+The service is synchronous and can take several minutes. While it runs, the
+CSP thread is stopped and the old trajectory buffer is cleared. A failed
+calibration requests a motor stop and returns `success: false` with the error.
+
+### Time and scheduling
+
+The control worker schedules cycles against `time.monotonic()`. It evaluates
+the trajectory at:
+
+```text
+ROS now + delay_compensation_ms
+```
+
+This split matters during rosbag playback: the motor loop continues at its
+real CSP frequency, while the desired trajectory follows `/clock`. A backward
+ROS-time jump resets waypoint-error evaluation so errors from the previous time
+epoch are not replayed.
+
+For rosbag playback:
+
+```bash
+ros2 launch franka_gripper_control faulhaber_gripper.launch.xml \
+  use_sim_time:=true
+```
+
+Then, in another terminal:
+
+```bash
+ros2 bag play /path/to/rosbag_directory --clock 200
+```
+
+Future waypoints must be available far enough ahead for delay compensation to
+be effective. If `/clock` is paused, the CSP worker continues holding the width
+selected at the paused ROS time.
+
+### Launch arguments
+
+Launch overrides use underscore names, for example `node_id:=2`. Except for
+`use_sim_time`, these are forwarded as command-line options rather than ROS
+parameters.
+
+#### ROS, CAN, and interface names
+
+| Launch argument | Default | Meaning |
+|---|---:|---|
+| `use_sim_time` | `false` | Use `/clock` instead of the system ROS clock |
+| `interface` | `can0` | SocketCAN interface |
+| `node_id` | `1` | CANopen node ID, 1–127 |
+| `topic` | `/polyumi/target_gripper` | Input trajectory topic |
+| `joint_name` | `fr3_gripper_width` | Selected and published joint name |
+| `calibration_file` | `~/.ros/faulhaber_gripper_limits.json` | Persistent calibration record |
+| `calibration_service` | `/faulhaber_gripper/calibrate` | Trigger service name |
+| `joint_state_topic` | `/faulhaber_gripper/joint_states` | Measured width output |
+| `current_topic` | `/faulhaber_gripper/motor_current_ma` | Current output |
+| `waypoint_error_topic` | `/faulhaber_gripper/waypoint_tracking_error_mm` | Waypoint error output |
+
+#### Calibration and geometry
+
+| Launch argument | Default | Units | Meaning |
+|---|---:|---:|---|
+| `max_width_mm` | `81.2` | mm | Physical width assigned to safe calibrated travel |
+| `first_speed_rpm` | `100` | motor rpm | Coarse hard-stop approach speed |
+| `second_speed_rpm` | `10` | motor rpm | Slower repeatability approach speed |
+| `current_limit_ma` | `300` | mA | Requested calibration current ceiling |
+| `stall_current_ma` | `220` | mA | Loaded-contact threshold; must be below the current ceiling |
+| `max_open_travel` | `1000000` | increments | Positive travel bound while searching for the open stop |
+| `max_close_travel` | `2000000` | increments | Negative travel bound while searching for the closed stop |
+| `homing_timeout` | `180` | s | Timeout for each calibration approach or move |
+
+The requested current limit never raises a lower continuous or peak current
+limit already stored in the controller.
+
+#### CSP and validation
+
+| Launch argument | Default | Units | Meaning |
+|---|---:|---:|---|
+| `csp_current_limit_ma` | `400` | mA | Requested temporary CSP current ceiling |
+| `csp_rate_hz` | `200` | Hz | Command, feedback, and telemetry-sample rate |
+| `delay_compensation_ms` | `13.3` | ms | Fixed trajectory look-ahead |
+| `max_tracking_error_mm` | `0` | mm | Shutdown threshold; zero disables following-error shutdown |
+| `max_command_speed_rpm` | `4000` | motor rpm | Preflight estimated segment-speed limit |
+
+With following-error shutdown disabled, an object may prevent the gripper from
+reaching the requested width while the controller limits motor current. Enable
+a nonzero tracking limit only if contact-induced following error should stop
+the system.
+
+List launch arguments with:
 
 ```bash
 ros2 launch franka_gripper_control faulhaber_gripper.launch.xml --show-args
 ```
 
-## Launch override examples
-
-Use another CAN interface and input topic:
-
-```bash
-ros2 launch franka_gripper_control faulhaber_gripper.launch.xml \
-  interface:=can1 \
-  topic:=/gripper/trajectory
-```
-
-Change the calibration approach speeds:
+Some advanced parser options are not exposed by the launch file. Use the
+executable directly when these must be changed:
 
 ```bash
-ros2 launch franka_gripper_control faulhaber_gripper.launch.xml \
-  first_speed_rpm:=40 \
-  second_speed_rpm:=5
+ros2 run franka_gripper_control faulhaber_trajectory_node \
+  --interface can0 \
+  --node-id 1 \
+  --calibration-file "$HOME/.ros/faulhaber_gripper_limits.json" \
+  --feedback-timeout-ms 4.0 \
+  --max-cycle-lateness-ms 20.0
 ```
 
-Change the CSP rate and current limit:
+| Direct-only option | Default | Meaning |
+|---|---:|---|
+| `--backoff-increments` | `100` | Calibration distance moved away between approaches |
+| `--stall-duration` | `0.4` s | Required duration of loaded, stopped feedback |
+| `--endpoint-margin` | `100` increments | Distance excluded from each mechanical stop |
+| `--feedback-timeout-ms` | `4.0` ms | Maximum TPDO wait after each SYNC |
+| `--telemetry-hz` | `5.0` Hz | Console telemetry rate |
+| `--max-cycle-lateness-ms` | `20.0` ms | Fatal CSP scheduler lateness threshold |
+| `--increments-per-revolution` | `3000.0` | Encoder scale used only for speed preflight |
+| `--raw-span-estimate` | `121000.0` | Conservative stroke estimate used only for speed preflight |
 
-```bash
-ros2 launch franka_gripper_control faulhaber_gripper.launch.xml \
-  csp_rate_hz:=200 \
-  csp_current_limit_ma:=400
-```
+Use `--help` on the executable for the authoritative option list.
 
-Enable a 5 mm software following-error shutdown:
-
-```bash
-ros2 launch franka_gripper_control faulhaber_gripper.launch.xml \
-  max_tracking_error_mm:=5
-```
-
-## Inspecting the interfaces
+### Inspect ROS interfaces
 
 ```bash
 ros2 topic echo /faulhaber_gripper/joint_states
@@ -207,17 +405,573 @@ ros2 topic hz /faulhaber_gripper/joint_states
 ros2 service list | grep faulhaber_gripper
 ```
 
-## Safety and shutdown behavior
+## Python motor API
 
-- The node holds the current calibrated width until the first trajectory is received.
-- An out-of-range width is clamped into `[0, --max-width-mm]`, with a throttled warning.
-- Excessive estimated waypoint-to-waypoint speed causes the complete incoming trajectory message to be rejected.
-- With `max_tracking_error_mm:=0`, contact-induced following error does not stop tracking; the CSP current limit remains active.
-- Communication failure, excessive scheduler lateness, or another drive error requests Quick Stop and disables the drive during shutdown.
-- Pressing `Ctrl+C` stops the scheduler and disables the drive.
+Applications that do not need ROS can use `FaulhaberCSPMotor` directly. This
+class owns the SocketCAN connection, calibration, temporary PDO mappings,
+current limits, and restoration.
 
-The CAN interface must already be configured, for example:
+### Main types
+
+```python
+from franka_gripper_control.faulhaber_csp_motor import (
+    CSPOptions,
+    CalibrationOptions,
+    DriveError,
+    FaulhaberCSPMotor,
+    Feedback,
+)
+```
+
+| Type or method | Purpose |
+|---|---|
+| `CalibrationOptions` | Hard-stop speeds, currents, travel bounds, detection thresholds, endpoint margin, and physical width |
+| `CSPOptions` | Runtime current ceiling and synchronous feedback timeout |
+| `Feedback` | Immutable statusword, raw position, width in mm, and current in mA |
+| `FaulhaberCSPMotor.start()` | Open SocketCAN, calibrate or load limits, configure CSP, and return the first held-position feedback |
+| `cycle_width_mm(width)` | Preferred operation: send one width target and return its synchronous feedback |
+| `command_width_mm(width)` | Send target and SYNC without consuming the resulting feedback |
+| `read_feedback()` | Consume one TPDO4 generated by the preceding SYNC |
+| `command_raw(target)` | Send a calibrated raw target; still enforces `safe_min`/`safe_max` |
+| `calibrate_and_restart()` | Leave CSP, recalibrate, save limits, and restart CSP |
+| `stop(quick=False)` | Disable the drive, restore temporary settings, and close the bus |
+
+### Use an existing calibration
+
+`FaulhaberCSPMotor` defaults to `recalibrate=True`, so applications that want
+to reuse a file must explicitly pass `recalibrate=False`:
+
+```python
+import time
+from pathlib import Path
+
+from franka_gripper_control.faulhaber_csp_motor import (
+    CSPOptions,
+    FaulhaberCSPMotor,
+)
+
+
+motor = FaulhaberCSPMotor(
+    interface="can0",
+    node_id=1,
+    calibration_path=Path.home() / ".ros" / "faulhaber_gripper_limits.json",
+    recalibrate=False,
+    csp=CSPOptions(
+        current_limit_ma=400,
+        feedback_timeout_ms=4.0,
+    ),
+)
+
+failed = False
+try:
+    feedback = motor.start()
+    print(f"Started at {feedback.width_mm:.2f} mm")
+
+    period = 1.0 / 200.0
+    next_cycle = time.monotonic()
+    target_mm = 60.0
+
+    for cycle in range(400):
+        next_cycle += period
+        feedback = motor.cycle_width_mm(target_mm)
+        if cycle % 40 == 0:
+            print(
+                f"width={feedback.width_mm:.2f} mm, "
+                f"current={feedback.current_ma} mA"
+            )
+        time.sleep(max(0.0, next_cycle - time.monotonic()))
+except BaseException:
+    failed = True
+    raise
+finally:
+    motor.stop(quick=failed)
+```
+
+The caller owns scheduling. `cycle_width_mm()` is blocking until TPDO feedback
+arrives or the configured timeout expires. A single thread should own one
+`FaulhaberCSPMotor`; the class does not serialize concurrent callers. A
+production scheduler should also detect accumulated lateness instead of merely
+skipping sleep when a cycle overruns, as the ROS worker does.
+
+Prefer `cycle_width_mm()` over separate `command_width_mm()` and
+`read_feedback()` calls. Every command sends a SYNC that requests a TPDO4, so
+failing to consume feedback can leave old TPDO frames queued on the bus.
+
+### Calibrate from Python
+
+This example starts calibration immediately and physically moves to both
+stops:
+
+```python
+from pathlib import Path
+
+from franka_gripper_control.faulhaber_csp_motor import (
+    CalibrationOptions,
+    FaulhaberCSPMotor,
+)
+
+
+motor = FaulhaberCSPMotor(
+    interface="can0",
+    node_id=1,
+    calibration_path=Path.home() / ".ros" / "faulhaber_gripper_limits.json",
+    recalibrate=True,
+    calibration=CalibrationOptions(
+        current_limit_ma=300,
+        stall_current_ma=220,
+        first_speed_rpm=100,
+        second_speed_rpm=10,
+        max_open_travel=1_000_000,
+        max_close_travel=2_000_000,
+        max_width_mm=81.2,
+    ),
+)
+
+try:
+    feedback = motor.start()
+    print(f"Calibration complete at {feedback.width_mm:.2f} mm")
+finally:
+    motor.stop()
+```
+
+### Calibration record and coordinate conversion
+
+The JSON record contains the measured stops, safe limits, endpoint margin,
+repeatability, maximum physical width, node/interface metadata, and calibration
+time. On load, the API requires at least:
+
+```json
+{
+  "safe_min": -120000,
+  "safe_max": -100,
+  "max_width_mm": 81.2
+}
+```
+
+The numbers above are illustrative only; never copy another mechanism's raw
+limits. The actual file is generated by calibration.
+
+Conversion is linear across the safe interval:
+
+```text
+width_mm = (raw - safe_min) * max_width_mm / (safe_max - safe_min)
+
+raw = round(safe_min + width_mm * (safe_max - safe_min) / max_width_mm)
+```
+
+The controller's underlying conversion between internal encoder increments and
+the user-unit Position Actual Value is described separately in the Factor Group
+section of the vendor manual
+([CANopen manual, pp. 46–49](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=46)).
+This package's width mapping is an additional application-level calibration
+between the two safe gripper endpoints.
+
+The API validates physical widths and raw targets before transmitting them.
+This software check complements, but does not replace, controller current
+limits and appropriately designed mechanical stops.
+
+## Hard-stop calibration sequence
+
+Calibration uses Profile Position
+([CANopen manual, pp. 50–54](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=50)),
+Homing
+([pp. 55–62](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=55)),
+and Profile Velocity
+([pp. 63–65](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=63))
+modes. The temporary current limits are object `0x2333`
+([pp. 77–78](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=77)).
+The complete procedure is:
+
+1. Save the controller's continuous current, peak current, acceleration, and
+   deceleration.
+2. Apply the lower of the requested and already stored current limits; set
+   acceleration and deceleration to `100 1/s^2` temporarily.
+3. In Profile Velocity mode, approach the opening stop at the first speed.
+4. Confirm contact only when current is above the threshold and velocity is
+   low for the required duration, while enforcing direction, travel, and time
+   bounds.
+5. Back away in Profile Position mode and approach the opening stop again at
+   the second speed.
+6. Use homing method 35 to define that fully open position as raw zero.
+7. Approach the closing stop twice, backing away between attempts. The two
+   detections must agree within the repeatability tolerance.
+8. Average the closing measurements, remove an endpoint margin from both
+   mechanical stops, and move away from contact to the safe closed coordinate.
+9. Restore the original current, acceleration, and deceleration settings in a
+   `finally` path, including after a failed calibration.
+
+Contact detection ignores the first 300 ms of an approach so acceleration is
+not mistaken for a stall. It requires all of the following simultaneously:
+
+- absolute current at or above `stall_current_ma`;
+- absolute velocity at or below `stall_velocity_rpm`;
+- position variation within `stall_position_span`; and
+- persistence for `stall_duration`.
+
+## Low-level CANopen protocol
+
+Most users should call `FaulhaberCSPMotor` rather than construct frames
+directly. This section documents what the implementation sends so the system
+can be audited, debugged, or integrated with another CANopen master. CANopen
+services and the predefined identifier distribution are introduced on pages
+15–18 of the vendor manual
+([CANopen manual, pp. 15–18](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=15)).
+
+All multi-byte values are little-endian. CAN identifiers are standard 11-bit
+identifiers; no extended frames are used.
+
+### CAN identifiers
+
+For node ID `N`:
+
+| COB-ID | Direction | Purpose in this package |
+|---:|---|---|
+| `0x000` | Host -> network | NMT command; `01 N` starts node `N` |
+| `0x080` | Host -> network | Zero-length CANopen SYNC object |
+| `0x080 + N` | Drive -> host | Emergency object, observed by the checker |
+| `0x200 + N` | Host -> drive | Temporarily configured synchronous RPDO1: Controlword + Target Position |
+| `0x480 + N` | Drive -> host | Temporarily configured synchronous TPDO4: Statusword + Position + Current |
+| `0x580 + N` | Drive -> host | SDO response |
+| `0x600 + N` | Host -> drive | SDO request |
+| `0x700 + N` | Both | Boot-up/heartbeat response and node-guard remote request |
+
+The SDO identifiers are fixed by the CANopen predefined connection set. RPDO1
+and TPDO4 COB-IDs are explicitly set during CSP configuration and restored at
+shutdown. See the identifier distribution and delivered PDO layouts on pages
+17–21, the SYNC object on page 27, and NMT/boot-up identifiers on pages 28–30
+([CANopen manual, pp. 17–21](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=17),
+[p. 27](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=27),
+[pp. 28–30](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=28)).
+
+### Expedited SDO reads and writes
+
+SDO requests and responses are always eight data bytes in this implementation.
+The index is encoded low byte first. The upload/download layouts and abort
+codes are documented on pages 22–24
+([CANopen manual, pp. 22–24](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=22)).
+
+Read object `index:subindex`:
+
+```text
+Host -> 0x600+N: 40  index-low  index-high  subindex  00 00 00 00
+Drive -> 0x580+N: CS  index-low  index-high  subindex  D0 D1 D2 D3
+```
+
+Successful upload response command specifiers are:
+
+| Response `CS` | Valid data bytes |
+|---:|---:|
+| `0x4F` | 1 |
+| `0x4B` | 2 |
+| `0x47` | 3 |
+| `0x43` | 4 |
+
+Write object `index:subindex`:
+
+| Request `CS` | Payload type | Layout after subindex |
+|---:|---|---|
+| `0x2F` | U8 | 1 data byte, then padding |
+| `0x2B` | U16 | 2 little-endian data bytes, then padding |
+| `0x23` | I32 or U32 | 4 little-endian data bytes |
+
+A successful SDO download response begins with `0x60`. A response beginning
+with `0x80` is an SDO abort; bytes 4–7 contain the 32-bit abort code.
+
+Examples for node 1:
+
+```text
+Read Statusword 0x6041:       ID 0x601  DATA 40 41 60 00 00 00 00 00
+Select CSP mode 8 at 0x6060:  ID 0x601  DATA 2F 60 60 00 08 00 00 00
+Successful mode-write reply:  ID 0x581  DATA 60 60 60 00 00 00 00 00
+```
+
+The second and third `60` bytes in the response have different meanings: byte
+0 is the success command specifier, while bytes 1–2 are the little-endian
+object index `0x6060`.
+
+### Object dictionary entries used
+
+| Index | Subindex | Access | Use |
+|---:|---:|---|---|
+| `0x1000` | `0` | read | Device type in the connection checker |
+| `0x1400` | `1`, `2` | read/write | RPDO1 COB-ID and transmission type |
+| `0x1600` | `0...` | read/write | RPDO1 mapping count and entries |
+| `0x1803` | `1`, `2` | read/write | TPDO4 COB-ID and transmission type |
+| `0x1A03` | `0...` | read/write | TPDO4 mapping count and entries |
+| `0x2333` | `1`, `2` | read/write | FAULHABER continuous and peak current limits |
+| `0x6040` | `0` | read/write | CiA 402 Controlword |
+| `0x6041` | `0` | read | CiA 402 Statusword |
+| `0x6060` | `0` | read/write | Requested mode of operation |
+| `0x6061` | `0` | read | Active mode of operation |
+| `0x6064` | `0` | read | Position Actual Value |
+| `0x606C` | `0` | read | Velocity Actual Value |
+| `0x6078` | `0` | read | Current Actual Value in mA |
+| `0x607A` | `0` | read/write | Target Position |
+| `0x6083` | `0` | read/write | Profile Acceleration |
+| `0x6084` | `0` | read/write | Profile Deceleration |
+| `0x6098` | `0` | read/write | Homing Method; method 35 sets current position as zero |
+| `0x60FF` | `0` | read/write | Target Velocity in rpm |
+
+The corresponding object-dictionary tables are on pages 94–100 for
+communication objects, pages 101–106 for FAULHABER-specific objects, and pages
+107–111 for CiA 402 drive objects
+([CANopen manual, pp. 94–100](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=94),
+[pp. 101–106](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=101),
+[pp. 107–111](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=107)).
+
+Mode values written to `0x6060` are:
+
+| Value | Mode | Use here |
+|---:|---|---|
+| `1` | Profile Position | Backoff and endpoint moves |
+| `3` | Profile Velocity | Guarded hard-stop approaches |
+| `6` | Homing | Establish the open position as zero |
+| `8` | Cyclic Synchronous Position | Runtime trajectory tracking |
+
+These mode values and the active-mode readback object `0x6061` are documented
+on page 45
+([CANopen manual, p. 45](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=45)).
+
+### CiA 402 Controlwords and Statusword checks
+
+The drive-enable state transition is performed with SDO writes to `0x6040`.
+The CiA 402 state machine, Controlword bits, enable example, and Statusword bits
+are on pages 37–44
+([CANopen manual, pp. 37–44](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=37)):
+
+| Controlword | Binary | Meaning | Required masked Statusword |
+|---:|---:|---|---:|
+| `0x0006` | `0000 0000 0000 0110` | Shutdown / Ready to Switch On | `0x0021` |
+| `0x0007` | `0000 0000 0000 0111` | Switch On | `0x0023` |
+| `0x000F` | `0000 0000 0000 1111` | Enable Operation | `0x0027` |
+
+The code masks Statusword with `0x006F` before comparing the state. Statusword
+bit 3 (`0x0008`) is treated as a fault in every motion mode.
+
+Additional Controlwords are mode-dependent:
+
+| Value | Use |
+|---:|---|
+| `0x0000` | Disable the drive |
+| `0x0002` | Request Quick Stop after a control/startup failure |
+| `0x001F` | Start homing while Operation Enabled |
+| `0x003F` | Absolute Profile Position: new setpoint + change immediately |
+| `0x002F` | Clear the absolute new-setpoint bit |
+| `0x007F` | Relative Profile Position: relative + new setpoint + change immediately |
+| `0x006F` | Clear the relative new-setpoint bit |
+
+In Profile Position mode, Statusword bit 12 acknowledges a new setpoint and bit
+10 indicates target reached. In Homing mode, bit 12 indicates homing attained,
+bit 10 indicates the target is reached, and bit 13 indicates a homing error.
+
+### PDO remapping for CSP
+
+Before remapping a PDO, the code follows the CANopen mapping sequence:
+
+1. snapshot the original COB-ID, transmission type, and mappings;
+2. set COB-ID bit 31 to disable the PDO;
+3. write mapping count zero;
+4. write each mapping entry;
+5. write the new mapping count;
+6. set transmission type `1`, synchronous on every SYNC; and
+7. write the active COB-ID with bit 31 clear.
+
+RPDO1 mapping at object `0x1600`:
+
+| Entry | Mapping value | Decoded field |
+|---:|---:|---|
+| 1 | `0x60400010` | `0x6040:00`, 16-bit Controlword |
+| 2 | `0x607A0020` | `0x607A:00`, 32-bit Target Position |
+
+TPDO4 mapping at object `0x1A03`:
+
+| Entry | Mapping value | Decoded field |
+|---:|---:|---|
+| 1 | `0x60410010` | `0x6041:00`, 16-bit Statusword |
+| 2 | `0x60640020` | `0x6064:00`, 32-bit Position Actual Value |
+| 3 | `0x60780010` | `0x6078:00`, 16-bit Current Actual Value |
+
+The mapping value packs `index`, `subindex`, and field length in bits. The
+resulting RPDO is six bytes and the TPDO is eight bytes. PDO transmission types
+and the required remapping procedure are described on pages 18–21
+([CANopen manual, pp. 18–21](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=18)).
+
+### One CSP command/feedback cycle
+
+After the drive is in CSP and Operation Enabled, one cycle is:
+
+1. Convert width in millimetres to a signed 32-bit raw position.
+2. Verify the raw position lies inside `[safe_min, safe_max]`.
+3. Send synchronous RPDO1 to `0x200 + node_id`:
+
+   ```text
+   byte 0..1: U16 Controlword = 0x000F
+   byte 2..5: I32 Target Position
+   ```
+
+4. Send a zero-length SYNC frame on ID `0x080`. The drive applies the staged
+   RPDO and emits TPDO4 because both PDO transmission types are `1`.
+5. Receive TPDO4 from `0x480 + node_id`:
+
+   ```text
+   byte 0..1: U16 Statusword
+   byte 2..5: I32 Position Actual Value
+   byte 6..7: I16 Current Actual Value in mA
+   ```
+
+6. Reject feedback if fault bit 3 is set or the masked state is not Operation
+   Enabled (`0x0027`).
+
+The zero-payload SYNC frame and its synchronous RxPDO/TxPDO behavior are
+specified on page 27
+([CANopen manual, p. 27](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=27)).
+
+Illustrative node-1 frames for raw target `-12345` and feedback current
+`+250 mA` are:
+
+```text
+RPDO1: ID 0x201  DATA 0F 00 C7 CF FF FF
+SYNC:  ID 0x080  DATA <empty>
+TPDO4: ID 0x481  DATA 27 00 C7 CF FF FF FA 00
+```
+
+These bytes are an encoding example, not safe values for a particular gripper.
+Do not send them with `cansend`: CSP mode, PDO mappings, current limits, and
+calibrated travel must already be correct.
+
+### Startup sequence
+
+`FaulhaberCSPMotor.start()` performs the following:
+
+1. Open the SocketCAN bus and read current Statusword, mode, and position.
+2. Send NMT Start Remote Node: CAN ID `0x000`, data `01 node_id`.
+3. Select Profile Position mode and transition through Controlwords `0x0006`,
+   `0x0007`, and `0x000F`.
+4. Calibrate or load the calibration record.
+5. Save continuous and peak current limits and apply the lowest of the stored
+   limits and requested CSP limit.
+6. Disable the drive, read current position, and write that position as the
+   first target so CSP entry cannot cause a setpoint jump.
+7. Select mode 8, configure RPDO1 and TPDO4, and repeat the CiA 402 enable
+   transition.
+8. Send the current position followed by SYNC and read the first TPDO4.
+
+The NMT Start command is tabulated on pages 28–29, and the enable sequence is
+the worked example on page 41
+([CANopen manual, pp. 28–29](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=28),
+[p. 41](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=41)).
+
+If any step fails, `start()` requests a quick stop where possible and executes
+the normal restoration path.
+
+### Shutdown and restoration
+
+`stop()` is idempotent and best-effort. It:
+
+1. optionally writes Quick Stop Controlword `0x0002`;
+2. disables the drive with `0x0000`;
+3. restores the original TPDO4 mapping;
+4. restores the original RPDO1 mapping;
+5. restores the original operating mode;
+6. restores continuous and peak current limits; and
+7. closes the SocketCAN bus.
+
+Quick Stop, Disable Voltage, and the other Controlword state commands are
+defined on pages 40–42
+([CANopen manual, pp. 40–42](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=40)).
+
+A restoration failure is printed but does not prevent the remaining cleanup
+steps. Normal ROS shutdown disables the drive without Quick Stop; worker or
+startup errors request Quick Stop first.
+
+## Safety behavior and limitations
+
+- Current limits, travel bounds, endpoint margins, timeouts, state checks, and
+  raw-target validation are independent safeguards; none replaces appropriate
+  hardware safety.
+- The node holds its current calibrated width until a valid trajectory arrives
+  and holds the final trajectory width after the buffer ends.
+- The ROS node clamps out-of-range finite widths into its configured interval
+  and emits a throttled warning. Direct Python motor commands reject widths
+  outside the calibrated interval.
+- Incoming trajectory velocity and acceleration arrays are ignored; motion is
+  defined only by width positions and timestamps.
+- `max_command_speed_rpm` is a preflight estimate based on a configured stroke
+  estimate. It does not configure the controller's own velocity limit.
+- Zero `max_tracking_error_mm` permits persistent position error during object
+  contact. The temporary CSP current ceiling remains active.
+- A TPDO timeout, controller reboot, drive fault, lost Operation Enabled state,
+  or excessive scheduler lateness stops the worker and triggers shutdown.
+- Calibration is tied to a particular mechanism, transmission, node, and width
+  definition. Recalibrate after mechanical changes and do not share limit files
+  between grippers.
+- Width conversion is linear between calibrated endpoints. Nonlinear linkages
+  require a different conversion model.
+
+## Troubleshooting
+
+### No SDO response
+
+Check controller power, CAN high/low polarity, common reference, termination,
+bitrate, node ID, and whether another process owns the node's SDO channel. Use
+the read-only checker with the ROS node stopped.
+
+### SocketCAN is not `ERROR-ACTIVE`
+
+Inspect:
 
 ```bash
-sudo ip link set can0 up type can bitrate 500000
+ip -details -statistics link show can0
+```
+
+Bring the interface down before changing bitrate. Power-cycle or recover the
+adapter/controller as required after `BUS-OFF`; do not repeatedly command
+motion on an unhealthy bus.
+
+### The node starts but says motor tracking is not ready
+
+The calibration file may be absent or invalid, the controller may not respond,
+or CSP setup may have failed. Clear the mechanism and call the calibration
+service only after resolving CAN errors.
+
+### The first trajectory does not move
+
+The first point of the first accepted chunk is replaced with measured width to
+avoid a startup jump. Send at least two points, with the desired target after
+the initial timestamp.
+
+### A trajectory is rejected or clamped
+
+Read the throttled warning in the node log. A width outside the configured
+range is clamped before speed validation. A missing joint name, empty or
+malformed points, a non-finite width, non-increasing timestamps, or estimated
+segment speed above the configured limit rejects the complete message.
+
+### Feedback timeout at high CSP rates
+
+The default TPDO timeout is 4 ms at a 200 Hz loop. Check bus load and latency
+before increasing the timeout or reducing the rate; the timeout must still fit
+the intended control schedule.
+
+### Rosbag playback does not progress
+
+Launch with `use_sim_time:=true` and play the bag with `--clock`. Confirm that
+`/clock` is advancing and that the bag contains trajectory timestamps
+consistent with its clock epoch.
+
+## Source layout
+
+| File | Responsibility |
+|---|---|
+| [`faulhaber_joint_trajectory_node.py`](franka_gripper_control/faulhaber_joint_trajectory_node.py) | ROS interfaces, trajectory validation/buffering, CSP worker, CLI |
+| [`faulhaber_csp_motor.py`](franka_gripper_control/faulhaber_csp_motor.py) | CANopen/CiA 402 primitives, calibration, CSP API, restoration |
+| [`check_faulhaber_connection.py`](franka_gripper_control/check_faulhaber_connection.py) | Read-only SocketCAN and controller health check |
+| [`faulhaber_gripper.launch.xml`](launch/faulhaber_gripper.launch.xml) | Supported launch arguments and defaults |
+| [`docs/`](docs/README.md) | Bundled FAULHABER manuals, page map, revisions, and checksums |
+
+For the most precise API details, see the NumPy-style docstrings in these
+modules and run:
+
+```bash
+ros2 run franka_gripper_control faulhaber_trajectory_node --help
 ```

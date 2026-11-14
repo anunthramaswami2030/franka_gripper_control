@@ -1,13 +1,24 @@
 #!/usr/bin/env python3
-"""Track trajectory_msgs/JointTrajectory chunks with a FAULHABER gripper.
+"""Track ROS joint trajectories with a CANopen FAULHABER gripper.
 
-The ROS callback only validates and buffers trajectories.  A dedicated thread
-runs the CANopen CSP loop at a fixed monotonic rate, evaluates the trajectory in
-ROS time, adds an experimentally measured fixed-delay lead, and sends the
-interpolated width target to the motor.
+The subscription callback validates incoming
+``trajectory_msgs/msg/JointTrajectory`` chunks and merges them into a
+thread-safe waypoint buffer.  It never communicates with the motor directly.
+A dedicated worker thread owns the time-critical control path: it samples the
+buffer at a fixed monotonic rate, evaluates trajectory timestamps in ROS time,
+adds a fixed delay-compensation lead, and performs one CANopen Cyclic
+Synchronous Position (CSP) command/feedback exchange per cycle.
 
-For rosbag playback, run this node with ``use_sim_time:=true`` and play the bag
-with a high-rate /clock publisher (see the commands printed by --help).
+The separation keeps ROS callback latency out of the CSP schedule while still
+allowing simulated ROS time during rosbag playback.  For playback, run the node
+with ``use_sim_time:=true`` and publish ``/clock`` at a high rate (see
+``--help`` for an example).
+
+Notes
+-----
+ROS joint positions are gripper opening widths in metres.  The motor wrapper
+uses millimetres at its public boundary and calibrated encoder increments on
+the CANopen bus.
 """
 
 from __future__ import annotations
@@ -39,15 +50,34 @@ from .faulhaber_csp_motor import (
 
 @dataclass(frozen=True, order=True)
 class TimedWidth:
+    """One absolute-time gripper-width waypoint.
+
+    Attributes
+    ----------
+    ros_time_ns : int
+        Absolute ROS timestamp in nanoseconds.
+    width_mm : float
+        Requested gripper opening in millimetres.
+    is_source_waypoint : bool, optional
+        ``True`` for a point received from ROS; ``False`` for a synthetic hold
+        point inserted while joining trajectory chunks.
+    """
+
     ros_time_ns: int
     width_mm: float
     is_source_waypoint: bool = True
 
 
 class TrajectoryBuffer:
-    """Thread-safe, replaceable future waypoint buffer."""
+    """Store and interpolate replaceable, absolute-time trajectory chunks.
+
+    A mutex protects the buffer because ROS callbacks write it while the CSP
+    worker samples it.  New receding-horizon chunks replace overlapping future
+    points but preserve earlier history needed to interpolate continuously.
+    """
 
     def __init__(self) -> None:
+        """Create an empty waypoint buffer."""
         self._lock = threading.Lock()
         self._points: list[TimedWidth] = []
         self._last_receive_mono: float | None = None
@@ -58,6 +88,24 @@ class TrajectoryBuffer:
         receive_ros_ns: int,
         current_width_mm: float,
     ) -> None:
+        """Merge a new trajectory chunk into the buffered future.
+
+        Parameters
+        ----------
+        points : list[TimedWidth]
+            Non-empty trajectory chunk in increasing timestamp order.
+        receive_ros_ns : int
+            ROS time at which the chunk was received.
+        current_width_mm : float
+            Width to hold if this is the first chunk and its first point lies
+            in the future.
+
+        Notes
+        -----
+        A synthetic point at receipt time prevents interpolation through a
+        period for which the new plan was not yet available.  Duplicate
+        timestamps resolve in favor of the newly received chunk.
+        """
         first = points[0].ros_time_ns
         with self._lock:
             # A newer receding-horizon chunk supersedes its overlapping future.
@@ -92,11 +140,26 @@ class TrajectoryBuffer:
             self._last_receive_mono = time.monotonic()
 
     def clear(self) -> None:
+        """Remove all waypoints and reset the message-age timestamp."""
         with self._lock:
             self._points.clear()
             self._last_receive_mono = None
 
     def sample(self, query_ns: int) -> tuple[float | None, str]:
+        """Sample the piecewise-linear width trajectory.
+
+        Parameters
+        ----------
+        query_ns : int
+            Absolute ROS time to evaluate, in nanoseconds.
+
+        Returns
+        -------
+        tuple[float | None, str]
+            Width in millimetres and a state label.  The width is ``None``
+            only when the buffer is empty; otherwise the endpoint is held
+            before or after the buffered time range.
+        """
         with self._lock:
             points = tuple(self._points)
         if not points:
@@ -116,6 +179,7 @@ class TrajectoryBuffer:
         return left.width_mm + fraction * (right.width_mm - left.width_mm), "interpolated"
 
     def last_receive_age(self) -> float | None:
+        """Return seconds since the last chunk arrived, using monotonic time."""
         with self._lock:
             stamp = self._last_receive_mono
         return None if stamp is None else time.monotonic() - stamp
@@ -125,7 +189,11 @@ class TrajectoryBuffer:
         start_exclusive_ns: int,
         end_inclusive_ns: int,
     ) -> list[TimedWidth]:
-        """Return original trajectory waypoints crossed during a ROS-time interval."""
+        """Return source waypoints crossed during a ROS-time interval.
+
+        Synthetic hold points are excluded so the diagnostic error topic
+        corresponds only to commands present in the source trajectory.
+        """
         if end_inclusive_ns <= start_exclusive_ns:
             return []
         with self._lock:
@@ -137,6 +205,7 @@ class TrajectoryBuffer:
             ]
 
     def bounds(self) -> tuple[int, int] | None:
+        """Return the first and last buffered ROS timestamps, if any."""
         with self._lock:
             if not self._points:
                 return None
@@ -144,11 +213,55 @@ class TrajectoryBuffer:
 
 
 class FaulhaberTrajectoryNode(Node):
+    """ROS 2 node that streams joint trajectories to a FAULHABER gripper.
+
+    Publishes
+    ---------
+    ``/faulhaber_gripper/joint_states`` : sensor_msgs/msg/JointState
+        Measured gripper opening in metres.  The topic is configurable with
+        ``--joint-state-topic``.
+    ``/faulhaber_gripper/motor_current_ma`` : std_msgs/msg/Float64
+        Measured motor current in milliamperes.  The topic is configurable
+        with ``--current-topic``.
+    ``/faulhaber_gripper/waypoint_tracking_error_mm`` : std_msgs/msg/Float64
+        Desired minus measured width at each original trajectory waypoint.
+        The topic is configurable with ``--waypoint-error-topic``.
+
+    Subscribes
+    ----------
+    ``/polyumi/target_gripper`` : trajectory_msgs/msg/JointTrajectory
+        Timestamped gripper-width commands.  The topic and controlled joint
+        name are configurable with ``--topic`` and ``--joint-name``.
+
+    Services
+    --------
+    ``/faulhaber_gripper/calibrate`` : std_srvs/srv/Trigger
+        Stop tracking, locate both mechanical hard stops, save calibration,
+        and restart CSP.  The service name is configurable with
+        ``--calibration-service``.
+
+    Notes
+    -----
+    ROS callbacks and the executor run on the calling thread.  CANopen CSP
+    exchanges run on ``faulhaber-csp-loop``; shared lifecycle and command
+    state are protected by locks and events.
+    """
+
     def __init__(
         self,
         args: argparse.Namespace,
         motor: FaulhaberCSPMotor,
     ) -> None:
+        """Create publishers, subscription, service, and worker state.
+
+        Parameters
+        ----------
+        args : argparse.Namespace
+            Validated command-line options from :func:`build_parser`.
+        motor : FaulhaberCSPMotor
+            Motor lifecycle wrapper used exclusively by the CSP worker and
+            calibration service.
+        """
         super().__init__("faulhaber_gripper_trajectory")
         self.args = args
         self.motor = motor
@@ -191,6 +304,18 @@ class FaulhaberTrajectoryNode(Node):
         )
 
     def start_tracking(self, initial_width_mm: float) -> None:
+        """Start the CSP worker while initially holding a measured width.
+
+        Parameters
+        ----------
+        initial_width_mm : float
+            Known physical gripper opening to hold until a trajectory arrives.
+
+        Raises
+        ------
+        RuntimeError
+            If the worker is already running.
+        """
         if self.worker is not None and self.worker.is_alive():
             raise RuntimeError("CSP scheduler is already running")
         with self._state_lock:
@@ -206,6 +331,7 @@ class FaulhaberTrajectoryNode(Node):
         self.worker.start()
 
     def stop_tracking(self) -> None:
+        """Signal the CSP worker to stop and wait briefly for its exit."""
         with self._state_lock:
             self._tracking_ready = False
         self.worker_stop_event.set()
@@ -213,16 +339,19 @@ class FaulhaberTrajectoryNode(Node):
             self.worker.join(timeout=2.0)
 
     def request_stop(self) -> None:
+        """Request both node shutdown and CSP-worker shutdown."""
         self.shutdown_event.set()
         self.stop_tracking()
 
     def current_command_mm(self) -> float | None:
+        """Return the worker's held command, or ``None`` when not ready."""
         with self._state_lock:
             if not self._tracking_ready:
                 return None
             return self._current_command_mm
 
     def _warn_throttled(self, text: str) -> None:
+        """Log at most one validation warning per monotonic second."""
         now = time.monotonic()
         if now - self._last_warning_mono >= 1.0:
             self.get_logger().warning(text)
@@ -261,6 +390,12 @@ class FaulhaberTrajectoryNode(Node):
         request: Trigger.Request,
         response: Trigger.Response,
     ) -> Trigger.Response:
+        """Recalibrate the gripper and restart tracking.
+
+        The non-blocking lifecycle lock rejects concurrent transition
+        requests.  Calibration intentionally stops the CSP worker and clears
+        the old trajectory so no pre-calibration command is replayed.
+        """
         del request
         if not self._lifecycle_lock.acquire(blocking=False):
             response.success = False
@@ -292,6 +427,18 @@ class FaulhaberTrajectoryNode(Node):
         return response
 
     def _trajectory_callback(self, message: JointTrajectory) -> None:
+        """Validate, convert, and buffer one trajectory chunk.
+
+        Widths are converted from ROS metres to millimetres, and finite widths
+        outside the configured interval are clamped.  Malformed, non-finite,
+        non-monotonic, or excessively fast chunks are rejected as a whole so
+        the worker never observes a partially accepted command.
+
+        Parameters
+        ----------
+        message : trajectory_msgs/msg/JointTrajectory
+            Incoming trajectory containing the configured gripper joint.
+        """
         current_width = self.current_command_mm()
         if current_width is None:
             self._warn_throttled(
@@ -380,6 +527,14 @@ class FaulhaberTrajectoryNode(Node):
             )
 
     def _control_loop(self) -> None:
+        """Run fixed-rate CSP command/feedback cycles until stopped.
+
+        Scheduling and lateness checks use monotonic time so ROS simulated-time
+        jumps cannot corrupt the loop period.  Trajectory evaluation uses ROS
+        time so commands remain synchronized with a live system or rosbag.
+        Any exception is captured for the executor thread and requests an
+        orderly node shutdown.
+        """
         period = 1.0 / self.args.csp_rate_hz
         delay_ns = int(
             round(self.args.delay_compensation_ms * 1_000_000.0)
@@ -501,6 +656,7 @@ class FaulhaberTrajectoryNode(Node):
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """Build the command-line interface for ROS, CAN, and safety settings."""
     parser = argparse.ArgumentParser(
         description="Track ROS JointTrajectory chunks with a FAULHABER CSP gripper",
         epilog=(
@@ -526,7 +682,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--interface", default="can0")
     parser.add_argument("--node-id", type=int, default=1)
-    parser.add_argument("--calibration-file", type=Path, default=Path("faulhaber_gripper_limits.json"))
+    parser.add_argument(
+        "--calibration-file",
+        type=Path,
+        default=Path("faulhaber_gripper_limits.json"),
+    )
     parser.add_argument(
         "--calibration-service",
         default="/faulhaber_gripper/calibrate",
@@ -564,6 +724,15 @@ def validate_args(
     parser: argparse.ArgumentParser,
     args: argparse.Namespace,
 ) -> None:
+    """Reject inconsistent or unsafe command-line option values.
+
+    Parameters
+    ----------
+    parser : argparse.ArgumentParser
+        Parser used to report a standard command-line error.
+    args : argparse.Namespace
+        Parsed options to validate in place.
+    """
     if not 1 <= args.node_id <= 127:
         parser.error("--node-id must be from 1 through 127")
 
@@ -610,6 +779,20 @@ def validate_args(
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the ROS node and guarantee motor teardown on every exit path.
+
+    Parameters
+    ----------
+    argv : list[str] | None, optional
+        Process arguments, primarily injectable for testing.  ROS arguments
+        are removed before parsing this module's options.
+
+    Returns
+    -------
+    int
+        Process exit status: zero on clean shutdown, 130 on keyboard
+        interruption, and one for a handled motor or configuration error.
+    """
     parser = build_parser()
     ros_args = rclpy.utilities.remove_ros_args(args=sys.argv if argv is None else argv)
     args = parser.parse_args(ros_args[1:])
