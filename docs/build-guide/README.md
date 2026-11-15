@@ -52,7 +52,7 @@ Lop off both ends of the ethernet cable. Select five wires within the ethernet c
 
 ## Step 4: Reassemble the gripper
 
-Route the purple cable out of the outer shell. You may need to remove some insulation from the ethernet cable so that the wires fit through the hole.
+Route the ethernet cable out of the outer shell. You may need to remove some insulation from the ethernet cable so that the wires fit through the hole.
 
 <img src="../images/build-guide/franka-gripper-closed-up.jpg" alt="Reassembled Franka gripper with the purple cable exiting the outer shell" width="760">
 
