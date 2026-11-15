@@ -108,10 +108,10 @@ unchanged source document.
 ## Hardware build guide
 
 This guide describes the pictured gripper build using the standard connection
-assignment for a FAULHABER `2250 ... BX4 IMC CO` motor with connector option
-`3830`. Confirm the complete product designation and connector option on your
-motor before copying this build. The alternative supply option `7431` uses a
-different power assignment and is not covered here.
+assignment for a FAULHABER `2250 ... BX4 IMC CO` motor. Confirm the complete
+product designation and connector option on your motor before copying this
+build. The alternative supply option `7431` uses a different power assignment
+and is not covered here.
 
 > [!CAUTION]
 > This build involves exposed mains-voltage terminals, a 24 V supply capable of
@@ -126,56 +126,26 @@ different power assignment and is not covered here.
 
 | Component | Purpose and notes |
 |---|---|
-| [Purple Cat 6 Ethernet patch cable](https://www.amazon.com/dp/B06XBWPBHK) | Sacrificial multi-conductor cable. Both RJ45 plugs will be removed; it carries motor power and CAN, not Ethernet data. Confirm that its conductor gauge and construction are adequate for the motor current and cable length. |
-| [InnoMaker CAN DB9 120-ohm selectable terminal](https://www.amazon.com/dp/B0BD7CDQ31) | Breaks the PCAN adapter's DB9 connection out to `CANL`, `GND`, and `CANH`. Its jumper can add one 120-ohm end termination. |
-| [MEAN WELL LRS-200-24 power supply](https://www.digikey.com/en/products/detail/mean-well-usa-inc/LRS-200-24/7705026) | Regulated 24 V supply. This model can deliver far more current than the motor should receive during a fault, so use suitable output fusing or current limiting. |
+| [Purple Cat 6 Ethernet patch cable](https://www.amazon.com/dp/B06XBWPBHK) | Sacrificial multi-conductor cable. 
+| [InnoMaker CAN DB9 120-ohm selectable terminal](https://www.amazon.com/dp/B0BD7CDQ31) | Breaks the PCAN adapter's DB9 connection out to `CANL`, `GND`, and `CANH`. It also adds the nessesary 120 Ohm resistor. |
+| [MEAN WELL LRS-200-24 power supply](https://www.digikey.com/en/products/detail/mean-well-usa-inc/LRS-200-24/7705026) | Regulated 24 V supply. |
 | [PEAK PCAN-USB adapter, IPEH-002021](https://phytools.com/products/pcan-usb-adapter) | Connects the CAN bus to the Linux computer over USB. |
-| [Molex Micro-Fit 3.0 plug housing, 43020-0800](https://www.digikey.com/en/products/detail/molex/0430200800/252493) | Eight-circuit mating plug recommended for motor connector option `3830`; matching 43031-series male crimp terminals are sold separately. Select terminals for the actual wire gauge and use the specified crimp tooling. |
+| [Molex Pico-SPOX eight-position right-angle header, 0874380843](https://www.digikey.com/en/products/detail/molex/0874380843/699152) | Mating header used to connect the cable harness to the motor connector. |
 
-Also obtain wire labels, heat-shrink tubing, insulated splices or ferrules as
-appropriate, cable strain relief, a multimeter, and suitable power-supply
-input/output protection.
-
-> [!IMPORTANT]
-> The initially proposed Molex
-> [`0874380843`](https://www.digikey.com/en/products/detail/molex/0874380843/699152)
-> is a 1.5 mm-pitch Pico-SPOX right-angle PCB header; it is not the connector
-> specified for motor option `3830`. The
-> [motor datasheet, page 2](docs/EN_2250_BX4_IMC_RSCO_DFF.pdf#page=2) identifies
-> the motor-side connector as Micro-Fit 3.0 `43025-0800` and recommends mating
-> plug `43020-0800`. Recheck this against your exact motor option before ordering.
 
 ### Step 2: Remove the gripper mechanism
 
-Power down and electrically isolate the robot and gripper. Remove the Franka
-Hand outer shell using the applicable service procedure, retaining the
-fasteners and noting their locations. Do not pull on the motor ribbon cable or
-force the finger mechanism.
+Detach the Franka Hand from the robot and remove it from the robot. Disassemble the outer casing and extract its internals. Detach the existing cable used to connect the Franka Hand the Franka Arm. 
 
 <img src="docs/images/build-guide/franka-gripper.jpg" alt="Assembled Franka gripper mounted on the robot" width="760">
 
 *The assembled gripper before the outer shell is removed.*
 
-Carefully lift out the complete mechanical gripper assembly. The extracted
-mechanism should resemble the following photo; protect the exposed motor,
-controller board, lead screw, belt, and motor connector from debris and impact.
-
 <img src="docs/images/build-guide/gripper-internals.jpg" alt="Extracted Franka gripper mechanism showing the motor, lead screw, fingers, and controller board" width="680">
 
-*Extracted gripper internals and the FAULHABER motor cable.*
+*Extracted gripper internals.*
 
-### Step 3: Build and verify the wiring harness
-
-Cut both RJ45 plugs from the purple cable. Strip back only enough jacket to
-terminate the conductors, preserve the twist of the pair selected for
-`CAN_H`/`CAN_L`, and add strain relief at every breakout. Choose and record a
-conductor-color mapping; the colors in the drawing are schematic and do not
-define the colors inside every Ethernet cable.
-
-The red-tracer edge of the motor ribbon identifies connection 1. Confirm the
-connector orientation against the 2-by-4 layout on
-[motor datasheet page 2](docs/EN_2250_BX4_IMC_RSCO_DFF.pdf#page=2), then wire
-only the following four connections:
+### Step 3: Build the wiring harness
 
 | Motor connection | Function | Connect to |
 |---:|---|---|
@@ -184,60 +154,35 @@ only the following four connections:
 | 7 | `CAN_L` | CAN terminal `CANL` |
 | 8 | `CAN_H` | CAN terminal `CANH` |
 
-Leave connections 1 (`UP`), 4, 5, and 6 unconnected and individually
-insulated. In this build only `UMot` powers the standard motor connection;
-`UP` is not used. Never infer connector numbering from the view in a photo.
-
 ![FAULHABER gripper wiring diagram](docs/images/build-guide/wiring-diagram.png)
 
 The original, zoomable version is available as
 [wiring-diagram.pdf](docs/build-guide/wiring-diagram.pdf).
 
-Attach the DB9 terminal board to the PCAN-USB adapter and secure its screws.
-The completed CAN-adapter end should resemble the photo below. Enable the
-terminal board's 120-ohm resistor only when this adapter is at a physical end
-of the bus. The complete CAN bus must have exactly two end terminations; with
-power removed, two 120-ohm terminations normally measure approximately 60 ohms
-between `CAN_H` and `CAN_L`.
+Lop off both ends of the ethernet cable. Select five wires within the ethernet cable and use that to wire up up the components as depicted in the wiring diagram. Use XT30 connectors to connect the power and ground wires to the power supply so that power can be easily disconnected. The connections between the ethernet cable, CAN DB9 adapter, and power supply are shown below. 
 
 <img src="docs/images/build-guide/can-usb-adapter.jpg" alt="PEAK PCAN-USB adapter connected to the selectable DB9 CAN terminal and purple cable" width="480">
 
-*PCAN-USB adapter, DB9 terminal board, and the purple cable breakout.*
+*PCAN-USB adapter, DB9 terminal board, and the purple cable breakout. the wire with the XT30 connector goes to the power supply.*
 
-Before applying power:
-
-1. Verify every motor pin with a continuity tester rather than relying only on
-   conductor color.
-2. Confirm `+24 V` reaches motor connection 2 and supply `-V` reaches motor
-   connection 3, with no hard short between them.
-3. Confirm motor connections 7 and 8 reach `CANL` and `CANH`, respectively,
-   and neither CAN conductor is shorted to power.
-4. Confirm the shared CAN ground reaches motor connection 3 and supply `-V`.
-5. Confirm connections 1, 4, 5, and 6 are isolated, all exposed joints are
-   insulated, and the cable has mechanical strain relief.
-6. Verify CAN termination and set the supply to 24 V with conservative current
-   limiting or correctly sized output protection for first power-up.
 
 ### Step 4: Reassemble the gripper
 
 Route the purple cable out of the outer shell without crossing the lead screw,
 belt, finger slides, or other moving parts. Protect it from sharp edges, leave
 enough service slack for the mechanism, and add strain relief so pulling the
-external cable cannot load the motor connector. Refit the shell and check the
-full finger travel by hand with power still disconnected.
+external cable cannot load the motor connector.
 
-<img src="docs/images/build-guide/franka-gripper.jpg" alt="Reassembled Franka gripper with the outer shell closed" width="760">
+<img src="docs/images/build-guide/franka-gripper-closed-up.jpg" alt="Reassembled Franka gripper with the purple cable exiting the outer shell" width="760">
 
-*Reassembled gripper with the outer shell closed.*
+*Reassembled gripper with the purple cable routed out of the closed shell.*
 
 ### Step 5: Apply power
 
 Connect the PCAN-USB adapter to the computer. Clear the gripper workspace, keep
-an emergency disconnect within reach, and energize the 24 V supply while
-monitoring current, wiring temperature, odor, and the motor/controller. Remove
-power immediately if the current limit trips or anything behaves unexpectedly.
+an emergency disconnect within reach, and energize the 24 V supply.
 
-Once the hardware remains stable, continue with the [Quickstart](#quickstart)
+Continue with the [Quickstart](#quickstart)
 to configure `can0`, run the non-moving connection check, and start the ROS 2
 node.
 
