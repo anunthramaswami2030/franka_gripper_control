@@ -26,10 +26,6 @@ The user-facing gripper convention is:
 | Raw closed coordinate | Calibrated `safe_min` |
 | Raw open coordinate | Calibrated `safe_max` |
 
-The package directly owns the SocketCAN bus and the drive state. It is not a
-`ros2_control` hardware interface and should not run concurrently with another
-program that sends CANopen commands to the same node.
-
 > [!CAUTION]
 > Calibration intentionally drives the mechanism into both mechanical hard
 > stops. Clear the gripper, use conservative current/travel limits, keep an
@@ -60,37 +56,6 @@ python-can / SocketCAN ---- CANopen RPDO + SYNC / TPDO feedback ---- Drive
           +------ statusword, position, and motor current ----------+
 ```
 
-ROS callbacks never send CSP traffic. A dedicated worker thread performs one
-command/SYNC/feedback exchange per cycle, keeping executor latency out of the
-motor schedule. The ROS clock selects the desired point in the trajectory;
-monotonic time controls the actual loop period.
-
-## Hardware and software assumptions
-
-The current configuration assumes:
-
-- a FAULHABER controller supporting CANopen CiA 402 and CSP mode 8
-  ([CANopen manual, p. 45](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=45));
-- an 11-bit Classical CAN network at `500000` bit/s;
-- CANopen node ID `1` by default;
-- a Linux SocketCAN interface named `can0` by default; and
-- a gripper whose encoder position changes monotonically across its stroke.
-
-For the referenced `2250 ... BX4 IMC RS/CO` hardware, the product datasheet
-identifies connection 7 as `CAN_L`, connection 8 as `CAN_H`, and connection 3
-as `GND`
-([motor datasheet, p. 2](docs/EN_2250_BX4_IMC_RSCO_DFF.pdf#page=2)). Power
-connections differ between product options, so use the full product designation
-and its connection table rather than assuming a supply pinout. Follow normal
-CAN wiring practice, including a twisted pair and 120-ohm termination at both
-physical ends of the bus.
-
-The CANopen implementation follows the *FAULHABER Communication / Function
-Manual CANopen BLDC*, document 7000.05037
-([bundled manual](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf)).
-Object availability and electrical connections must still be checked for the
-exact controller firmware and motor variant.
-
 ## Bundled vendor documentation
 
 The exact vendor revisions used to document this implementation are stored in
@@ -107,20 +72,7 @@ unchanged source document.
 
 ## Hardware build guide
 
-This guide describes the pictured gripper build using the standard connection
-assignment for a FAULHABER `2250 ... BX4 IMC CO` motor. Confirm the complete
-product designation and connector option on your motor before copying this
-build. The alternative supply option `7431` uses a different power assignment
-and is not covered here.
-
-> [!CAUTION]
-> This build involves exposed mains-voltage terminals, a 24 V supply capable of
-> substantial current, and disassembly of a robot end effector. Disconnect the
-> robot and unplug the power supply before opening the gripper or changing any
-> wiring. Put the supply in a grounded, finger-safe enclosure with appropriate
-> input and output protection. Mains-side work must be performed by a qualified
-> person and follow local electrical codes. Do not apply power until the checks
-> in step 3 pass.
+This guide describes how to construct the cable nessesary for directly controling the Franka Hand motor over CAN. 
 
 ### Step 1: Obtain the components
 
@@ -135,11 +87,11 @@ and is not covered here.
 
 ### Step 2: Remove the gripper mechanism
 
-Detach the Franka Hand from the robot and remove it from the robot. Disassemble the outer casing and extract its internals. Detach the existing cable used to connect the Franka Hand the Franka Arm. 
+Detach the Franka Hand from the robot. Disassemble the outer casing and extract its internals. Detach the existing cable that connects the internal PCB the Franka Arm. 
 
 <img src="docs/images/build-guide/franka-gripper.jpg" alt="Assembled Franka gripper mounted on the robot" width="760">
 
-*The assembled gripper before the outer shell is removed.*
+*The assembled gripper attached to the Franka Arm before the outer shell is removed.*
 
 <img src="docs/images/build-guide/gripper-internals.jpg" alt="Extracted Franka gripper mechanism showing the motor, lead screw, fingers, and controller board" width="680">
 
