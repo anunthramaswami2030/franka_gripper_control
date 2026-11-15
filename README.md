@@ -1029,57 +1029,6 @@ startup errors request Quick Stop first.
 - Width conversion is linear between calibrated endpoints. Nonlinear linkages
   require a different conversion model.
 
-## Troubleshooting
-
-### No SDO response
-
-Check controller power, CAN high/low polarity, common reference, termination,
-bitrate, node ID, and whether another process owns the node's SDO channel. Use
-the read-only checker with the ROS node stopped.
-
-### SocketCAN is not `ERROR-ACTIVE`
-
-Inspect:
-
-```bash
-ip -details -statistics link show can0
-```
-
-Bring the interface down before changing bitrate. Power-cycle or recover the
-adapter/controller as required after `BUS-OFF`; do not repeatedly command
-motion on an unhealthy bus.
-
-### The node starts but says motor tracking is not ready
-
-The calibration file may be absent or invalid, the controller may not respond,
-or CSP setup may have failed. Clear the mechanism and call the calibration
-service only after resolving CAN errors.
-
-### The first trajectory does not move
-
-The first point of the first accepted chunk is replaced with measured width to
-avoid a startup jump. Send at least two points, with the desired target after
-the initial timestamp.
-
-### A trajectory is rejected or clamped
-
-Read the throttled warning in the node log. A width outside the configured
-range is clamped before speed validation. A missing joint name, empty or
-malformed points, a non-finite width, non-increasing timestamps, or estimated
-segment speed above the configured limit rejects the complete message.
-
-### Feedback timeout at high CSP rates
-
-The default TPDO timeout is 4 ms at a 200 Hz loop. Check bus load and latency
-before increasing the timeout or reducing the rate; the timeout must still fit
-the intended control schedule.
-
-### Rosbag playback does not progress
-
-Launch with `use_sim_time:=true` and play the bag with `--clock`. Confirm that
-`/clock` is advancing and that the bag contains trajectory timestamps
-consistent with its clock epoch.
-
 ## Source layout
 
 | File | Responsibility |
