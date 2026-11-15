@@ -13,6 +13,13 @@ For short, robotics-oriented definitions of CAN, CANopen, COB-IDs, SDOs, PDOs,
 SYNC, NMT, CiA 402, and CSP, see the main README's
 [CAN and CANopen glossary](../README.md#can-and-canopen-glossary).
 
+## Build guide assets
+
+The main README's [hardware build guide](../README.md#hardware-build-guide)
+uses the supplied assembly photographs and a rendered preview of the wiring
+diagram. The original one-page diagram is preserved as
+[wiring-diagram.pdf](build-guide/wiring-diagram.pdf).
+
 ## Included files
 
 | Document | Revision | Pages | SHA-256 |
