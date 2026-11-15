@@ -26,13 +26,6 @@ The user-facing gripper convention is:
 | Raw closed coordinate | Calibrated `safe_min` |
 | Raw open coordinate | Calibrated `safe_max` |
 
-> [!CAUTION]
-> Calibration intentionally drives the mechanism into both mechanical hard
-> stops. Clear the gripper, use conservative current/travel limits, keep an
-> emergency stop available, and supervise the complete calibration. Verify the
-> wiring and supply requirements against the datasheet for the exact motor
-> variant before applying power.
-
 ## Architecture
 
 ```text
@@ -56,7 +49,7 @@ python-can / SocketCAN ---- CANopen RPDO + SYNC / TPDO feedback ---- Drive
           +------ statusword, position, and motor current ----------+
 ```
 
-## Bundled vendor documentation
+## Vendor documentation
 
 The exact vendor revisions used to document this implementation are stored in
 [`docs/`](docs/README.md):
@@ -72,7 +65,7 @@ unchanged source document.
 
 ## Hardware build guide
 
-This guide describes how to construct the cable nessesary for directly controling the Franka Hand motor over CAN. 
+This guide describes how to construct the cable and perform the wiring nessesary for directly controling the Franka Hand motor over CAN. 
 
 ### Step 1: Obtain the components
 
@@ -115,15 +108,12 @@ Lop off both ends of the ethernet cable. Select five wires within the ethernet c
 
 <img src="docs/images/build-guide/can-usb-adapter.jpg" alt="PEAK PCAN-USB adapter connected to the selectable DB9 CAN terminal and purple cable" width="480">
 
-*PCAN-USB adapter, DB9 terminal board, and the purple cable breakout. the wire with the XT30 connector goes to the power supply.*
+*PCAN-USB adapter, DB9 terminal board, and the purple cable breakout. The wire with the XT30 connector goes to the power supply.*
 
 
 ### Step 4: Reassemble the gripper
 
-Route the purple cable out of the outer shell without crossing the lead screw,
-belt, finger slides, or other moving parts. Protect it from sharp edges, leave
-enough service slack for the mechanism, and add strain relief so pulling the
-external cable cannot load the motor connector.
+Route the purple cable out of the outer shell. You may need to remove some insulation from the ethernet cable so that the wires fit through the hole.
 
 <img src="docs/images/build-guide/franka-gripper-closed-up.jpg" alt="Reassembled Franka gripper with the purple cable exiting the outer shell" width="760">
 
@@ -163,18 +153,14 @@ cd ~/ros2_ws/src
 git clone https://github.com/anunthramaswami2030/franka_gripper_control.git
 cd ~/ros2_ws
 rosdep install --from-paths src --ignore-src -r -y
-colcon build --packages-select franka_gripper_control --symlink-install
+colcon build --packages-select franka_gripper_control
 source install/setup.bash
 ```
 
-If it is already cloned, start with `cd` to the workspace and run the final
-three commands. The runtime dependencies are ROS 2 `rclpy`, `trajectory_msgs`,
+The runtime dependencies are ROS 2 `rclpy`, `trajectory_msgs`,
 `sensor_msgs`, `std_msgs`, `std_srvs`, and Python `python-can`. The host also
 needs `iproute2` to inspect/configure SocketCAN; `can-utils` is optional but
 useful for diagnosis.
-
-Every new terminal must source the ROS installation and then the workspace's
-`install/setup.bash` before using the node or importing the installed package.
 
 ### 2. Bring up the CAN interface
 
@@ -270,7 +256,7 @@ Wait for `success: true`. The default launch file saves calibration at:
 ~/.ros/faulhaber_gripper_limits.json
 ```
 
-Do not reuse this file for a different gripper or after changing the mechanism.
+Do not reuse this file for a different gripper or after changing gripper tips.
 
 ### 6. Send a first trajectory
 
