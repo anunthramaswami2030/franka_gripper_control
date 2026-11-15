@@ -1,6 +1,6 @@
 # FAULHABER Gripper Control
 
-This ROS 2 package controls a FAULHABER-driven gripper over CANopen. It provides:
+This ROS 2 package that controls the Franka Hand over CANopen. It provides:
 
 - a ROS 2 node that accepts timestamped `JointTrajectory` chunks and tracks them
   in Cyclic Synchronous Position (CSP) mode;
@@ -66,7 +66,7 @@ unchanged source document.
 
 ## Quickstart
 
-This path covers setting up the repo and executing a commanded motion. It assumes:
+This covers setting up the repo and executing a commanded motion. It assumes:
 
 - ROS 2, `colcon`, and `rosdep` are installed and the ROS installation is
   sourced;
@@ -112,7 +112,7 @@ configuration problem.
 
 ### 3. Check the connection without moving the motor
 
-Stop other software that accesses this CANopen node, then run:
+Run:
 
 ```bash
 python3 -m franka_gripper_control.check_faulhaber_connection \
