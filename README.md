@@ -66,22 +66,16 @@ unchanged source document.
 
 ## Quickstart
 
-This path covers a new checkout through first commanded motion. It assumes:
+This path covers setting up the repo and executing a commanded motion. It assumes:
 
 - ROS 2, `colcon`, and `rosdep` are installed and the ROS installation is
   sourced;
 - the motor/controller is powered and wired to a Linux CAN adapter according
   to the exact product datasheet;
 - the CAN bus is terminated with 120 ohms at each physical end; and
-- the default controller settings are node ID `1` and `500000` bit/s.
-
-Replace the interface, node ID, or bitrate in the commands below if your setup
-differs. Only one program should control a CANopen node at a time.
+- the default controller settings are node ID `1` and `500000` bit/s
 
 ### 1. Clone, build, and source
-
-If the repository is not already in a ROS 2 workspace, clone it into the
-workspace's `src` directory:
 
 ```bash
 mkdir -p ~/ros2_ws/src
