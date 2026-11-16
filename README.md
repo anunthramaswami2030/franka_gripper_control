@@ -1,4 +1,4 @@
-# FAULHABER Gripper Control
+# Franka Gripper Control
 
 This ROS 2 package that controls the Franka Hand over CANopen. It provides:
 
