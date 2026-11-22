@@ -186,6 +186,28 @@ ros2 topic hz /faulhaber_gripper/joint_states
 ros2 service list | grep faulhaber_gripper
 ```
 
+## Connection checker
+
+`python3 -m franka_gripper_control.check_faulhaber_connection` checks kernel CAN
+state and error counters, requests a node-guard reply, and reads device type,
+statusword, mode, position, velocity, and current through SDO uploads. It also
+observes boot-up, emergency, and CAN error frames, then checks that kernel error
+counters have not increased. See the vendor descriptions of
+[node guarding](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=30),
+[SDO uploads](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=22),
+and [emergency frames](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=25).
+
+It sends no NMT state changes, Controlwords, mode writes, PDOs, SYNC, or motion
+targets. `RESULT: HEALTHY` verifies communication, not mechanical safety.
+
+| Option | Default | Meaning |
+|---|---:|---|
+| `--interface` | `can0` | SocketCAN interface |
+| `--node-id` | `1` | CANopen node ID, from 1 through 127 |
+| `--samples` | `10` | Number of statusword samples |
+| `--interval` | `0.5` s | Passive observation time after each sample |
+| `--response-timeout` | `1.0` s | Per-request timeout |
+
 ## Python motor API
 
 Applications that do not need ROS can use `FaulhaberCSPMotor` directly. This
@@ -220,7 +242,8 @@ from franka_gripper_control.faulhaber_csp_motor import (
 ### Use an existing calibration
 
 `FaulhaberCSPMotor` defaults to `recalibrate=True`, so applications that want
-to reuse a file must explicitly pass `recalibrate=False`:
+to reuse a file must explicitly pass `recalibrate=False`. This example holds
+the measured starting width for two seconds:
 
 ```python
 import time
@@ -250,7 +273,7 @@ try:
 
     period = 1.0 / 200.0
     next_cycle = time.monotonic()
-    target_mm = 60.0
+    target_mm = feedback.width_mm
 
     for cycle in range(400):
         next_cycle += period
@@ -268,8 +291,11 @@ finally:
     motor.stop(quick=failed)
 ```
 
-The caller owns scheduling. `cycle_width_mm()` is blocking until TPDO feedback
-arrives or the configured timeout expires. A single thread should own one
+The caller owns scheduling and target interpolation: `cycle_width_mm()` sends
+each target immediately, with no ramp or ROS segment-speed check. To move,
+generate targets from the measured starting width at the desired speed.
+The call blocks until TPDO feedback arrives or the configured timeout expires.
+A single thread should own one
 `FaulhaberCSPMotor`; the class does not serialize concurrent callers. A
 production scheduler should also detect accumulated lateness instead of merely
 skipping sleep when a cycle overruns, as the ROS worker does.
@@ -391,12 +417,9 @@ not mistaken for a stall. It requires all of the following simultaneously:
 
 ## Low-level CANopen protocol
 
-Most users should call `FaulhaberCSPMotor` rather than construct frames
-directly. This section documents what the implementation sends so the system
-can be audited, debugged, or integrated with another CANopen master. CANopen
-services and the predefined identifier distribution are introduced on pages
-15–18 of the vendor manual
-([CANopen manual, pp. 15–18](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=15)).
+This section describes the frames sent by `FaulhaberCSPMotor` for debugging
+and integration. For the CANopen introduction and identifier distribution, see
+[manual pp. 15–18](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=15).
 
 All multi-byte values are little-endian. CAN identifiers are standard 11-bit
 identifiers; no extended frames are used.
@@ -405,32 +428,20 @@ identifiers; no extended frames are used.
 
 | Term | Brief definition |
 |---|---|
-| CAN | **Controller Area Network**, a shared, differential serial bus. Every device sees every frame; the CAN identifier determines meaning and arbitration priority. |
-| CAN bus | The physical two-wire `CAN_H`/`CAN_L` network shared by the adapter and controllers. A linear bus normally has one 120-ohm terminator at each physical end. |
-| Bitrate | The bus signaling rate in bits per second. All devices must match; this repository defaults to `500000` bit/s. |
-| Frame | One CAN transmission containing an identifier and up to eight payload bytes in Classical CAN. A CAN identifier labels and prioritizes a frame; by itself it is not a source or destination address. |
-| Arbitration | CAN's automatic collision resolution when devices begin transmitting together. A lower numerical identifier has higher priority and continues without corrupting the winning frame. |
-| Remote frame | A CAN frame that requests another device to transmit data with the same identifier. The connection checker uses one for node guarding; motor control uses normal data frames. |
-| SocketCAN | Linux's CAN networking API. It represents a CAN adapter as an interface such as `can0`, which `python-can` opens for this package. |
-| CANopen | A higher-level protocol built on CAN that standardizes device configuration, network management, real-time data exchange, and device profiles. |
-| Node / node ID | One logical CANopen device and its address, normally `1` through `127`. This package defaults to motor-controller node `1`. |
-| COB-ID | **Communication Object Identifier**: the CAN identifier assigned to a CANopen message type. Many predefined COB-IDs are a function-code base plus the node ID. |
-| Object dictionary | The controller's indexed parameter database. An entry such as `0x6041:00` means index `0x6041`, subindex `0`, here the drive Statusword. |
-| SDO | **Service Data Object**, a request/response transfer used to read or write object-dictionary entries. It is suited to setup and diagnostics, not the 200 Hz control loop. CANopen calls a host read from the device an *upload* and a host write to the device a *download*. An *expedited* SDO carries a small value directly in the request or response frame. |
-| SDO command specifier (`CS`) | The first SDO payload byte, which identifies the read/write operation, transferred size, success, or abort response. |
-| PDO | **Process Data Object**, a compact real-time frame whose fields are configured in advance. It omits index metadata on every cycle, reducing bus traffic. |
-| RPDO / TPDO | **Receive PDO** and **Transmit PDO**, named from the controller's perspective. The controller receives command RPDOs and transmits feedback TPDOs. The number, such as RPDO1 or TPDO4, identifies a configured PDO channel. |
-| PDO mapping | The ordered list of object-dictionary fields packed into a PDO payload, including each field's bit length. |
-| SYNC | A broadcast CANopen synchronization frame. Here it tells the controller to apply the staged command RPDO and publish its synchronous feedback TPDO. |
-| NMT | **Network Management**, the CANopen service that starts, stops, resets, and monitors node communication state. |
-| Heartbeat / node guarding | Two ways to monitor whether a node is alive. Heartbeat is periodic transmission by the node; node guarding is a request/reply check initiated by the host. This repository's checker uses node guarding. |
-| EMCY | **Emergency object**, an asynchronous CANopen fault report sent by a controller. The checker observes these without changing drive state. |
-| CiA 402 | The CAN in Automation drive profile defining the motor-drive state machine, Controlword, Statusword, and operating modes. |
-| Controlword / Statusword | CiA 402 bit fields used to request drive-state transitions and report the resulting state or faults. They are not free-form commands or text messages. |
-| CSP | **Cyclic Synchronous Position**, CiA 402 mode 8. The host sends a position target each cycle, synchronized here with CANopen SYNC. |
-| Little-endian | Multi-byte numbers are sent least-significant byte first. For example, `0x6041` appears as bytes `41 60`. |
-| `U8`, `U16`, `U32` / `I16`, `I32` | Unsigned (`U`) or signed (`I`) integers whose suffix gives the number of bits. |
-| `ERROR-ACTIVE` | Normal CAN-controller state. `ERROR-WARNING` and `ERROR-PASSIVE` indicate rising error counters; `BUS-OFF` means the controller disconnected itself after severe repeated errors. |
+| CAN / CANopen | The physical shared bus / its device-configuration and control protocol. All devices must use the same bitrate, here `500000` bit/s. |
+| SocketCAN | Linux CAN interface (`can0`), accessed here through `python-can`. |
+| Node ID / COB-ID | Device address (`1`–`127`) / CAN identifier assigned to a message type. This package defaults to node `1`; the table below gives its message IDs. |
+| Object dictionary | Indexed controller parameters: `0x6041:00` is index `0x6041`, subindex `0` (Statusword). |
+| SDO | Request/reply parameter access for setup and diagnostics. A host read is an *upload*; a write is a *download*. |
+| PDO / mapping | Cyclic data frame / the ordered fields and bit lengths packed into it. RPDOs enter the drive; TPDOs leave it. |
+| SYNC | Broadcast that applies the staged RPDO command and triggers synchronous TPDO feedback. |
+| NMT | Network Management: starts, stops and resets node communication. |
+| Heartbeat / node guarding | Periodic node-liveness report / host-requested reply. The checker uses a CAN remote frame for node guarding. |
+| EMCY | Asynchronous drive fault report, observed by the checker. |
+| CiA 402 | Drive-state and operating-mode profile; Controlword requests transitions, Statusword reports state and faults. |
+| CSP | Cyclic Synchronous Position, mode `8`: one position target per cycle. |
+| `U8`, `U16`, `U32` / `I16`, `I32` | Unsigned / signed integers with the indicated bit width. |
+| `ERROR-ACTIVE` / `BUS-OFF` | Normal CAN-controller state / disconnected after severe repeated errors. `ERROR-WARNING` and `ERROR-PASSIVE` indicate increasing errors. |
 
 ### CAN identifiers
 
@@ -447,59 +458,27 @@ For node ID `N`:
 | `0x600 + N` | Host -> drive | SDO request |
 | `0x700 + N` | Both | Boot-up/heartbeat response and node-guard remote request |
 
-The SDO identifiers are fixed by the CANopen predefined connection set. RPDO1
-and TPDO4 COB-IDs are explicitly set during CSP configuration and restored at
-shutdown. See the identifier distribution and delivered PDO layouts on pages
-17–21, the SYNC object on page 27, and NMT/boot-up identifiers on pages 28–30
-([CANopen manual, pp. 17–21](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=17),
-[p. 27](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=27),
-[pp. 28–30](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=28)).
+SDO identifiers follow the predefined connection set. The code configures
+RPDO1 and TPDO4 COB-IDs temporarily and restores them at shutdown. Vendor
+references: [identifiers and PDOs, pp. 17–21](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=17),
+[SYNC, p. 27](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=27),
+[NMT/boot-up, pp. 28–30](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=28).
 
 ### Expedited SDO reads and writes
 
-SDO requests and responses are always eight data bytes in this implementation.
-The index is encoded low byte first. The upload/download layouts and abort
-codes are documented on pages 22–24
-([CANopen manual, pp. 22–24](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=22)).
+This implementation uses eight-byte expedited SDOs. Byte 0 is the command
+specifier, bytes 1–2 the little-endian object index, byte 3 the subindex, and
+bytes 4–7 the value or padding:
 
-Read object `index:subindex`:
+| Operation | Command specifier |
+|---|---|
+| Read request | `0x40` |
+| Read response, 1/2/3/4 valid data bytes | `0x4F` / `0x4B` / `0x47` / `0x43` |
+| Write request, U8/U16/I32 or U32 | `0x2F` / `0x2B` / `0x23` |
+| Successful write response | `0x60` |
+| Abort response | `0x80`; bytes 4–7 contain the 32-bit abort code |
 
-```text
-Host -> 0x600+N: 40  index-low  index-high  subindex  00 00 00 00
-Drive -> 0x580+N: CS  index-low  index-high  subindex  D0 D1 D2 D3
-```
-
-Successful upload response command specifiers are:
-
-| Response `CS` | Valid data bytes |
-|---:|---:|
-| `0x4F` | 1 |
-| `0x4B` | 2 |
-| `0x47` | 3 |
-| `0x43` | 4 |
-
-Write object `index:subindex`:
-
-| Request `CS` | Payload type | Layout after subindex |
-|---:|---|---|
-| `0x2F` | U8 | 1 data byte, then padding |
-| `0x2B` | U16 | 2 little-endian data bytes, then padding |
-| `0x23` | I32 or U32 | 4 little-endian data bytes |
-
-A successful SDO download response begins with `0x60`. A response beginning
-with `0x80` is an SDO abort; bytes 4–7 contain the 32-bit abort code.
-
-Examples for node 1:
-
-```text
-Read Statusword 0x6041:       ID 0x601  DATA 40 41 60 00 00 00 00 00
-Select CSP mode 8 at 0x6060:  ID 0x601  DATA 2F 60 60 00 08 00 00 00
-Successful mode-write reply:  ID 0x581  DATA 60 60 60 00 00 00 00 00
-```
-
-The second and third `60` bytes in the response have different meanings: byte
-0 is the success command specifier, while bytes 1–2 are the little-endian
-object index `0x6060`.
+Complete layouts and abort codes: [manual pp. 22–24](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=22).
 
 ### Object dictionary entries used
 
@@ -524,12 +503,9 @@ object index `0x6060`.
 | `0x6098` | `0` | read/write | Homing Method; method 35 sets current position as zero |
 | `0x60FF` | `0` | read/write | Target Velocity in rpm |
 
-The corresponding object-dictionary tables are on pages 94–100 for
-communication objects, pages 101–106 for FAULHABER-specific objects, and pages
-107–111 for CiA 402 drive objects
-([CANopen manual, pp. 94–100](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=94),
-[pp. 101–106](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=101),
-[pp. 107–111](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=107)).
+Vendor object dictionaries: [communication, pp. 94–100](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=94),
+[FAULHABER-specific, pp. 101–106](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=101),
+[CiA 402, pp. 107–111](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=107).
 
 Mode values written to `0x6060` are:
 
@@ -540,22 +516,18 @@ Mode values written to `0x6060` are:
 | `6` | Homing | Establish the open position as zero |
 | `8` | Cyclic Synchronous Position | Runtime trajectory tracking |
 
-These mode values and the active-mode readback object `0x6061` are documented
-on page 45
-([CANopen manual, p. 45](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=45)).
+Mode values and active-mode readback (`0x6061`): [manual p. 45](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=45).
 
 ### CiA 402 Controlwords and Statusword checks
 
-The drive-enable state transition is performed with SDO writes to `0x6040`.
-The CiA 402 state machine, Controlword bits, enable example, and Statusword bits
-are on pages 37–44
-([CANopen manual, pp. 37–44](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=37)):
+The drive-enable sequence writes these Controlwords to `0x6040` and checks
+Statusword after each transition ([manual pp. 37–44](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=37)):
 
-| Controlword | Binary | Meaning | Required masked Statusword |
-|---:|---:|---|---:|
-| `0x0006` | `0000 0000 0000 0110` | Shutdown / Ready to Switch On | `0x0021` |
-| `0x0007` | `0000 0000 0000 0111` | Switch On | `0x0023` |
-| `0x000F` | `0000 0000 0000 1111` | Enable Operation | `0x0027` |
+| Controlword | Meaning | Required masked Statusword |
+|---:|---|---:|
+| `0x0006` | Shutdown / Ready to Switch On | `0x0021` |
+| `0x0007` | Switch On | `0x0023` |
+| `0x000F` | Enable Operation | `0x0027` |
 
 The code masks Statusword with `0x006F` before comparing the state. Statusword
 bit 3 (`0x0008`) is treated as a fault in every motion mode.
@@ -603,10 +575,8 @@ TPDO4 mapping at object `0x1A03`:
 | 2 | `0x60640020` | `0x6064:00`, 32-bit Position Actual Value |
 | 3 | `0x60780010` | `0x6078:00`, 16-bit Current Actual Value |
 
-The mapping value packs `index`, `subindex`, and field length in bits. The
-resulting RPDO is six bytes and the TPDO is eight bytes. PDO transmission types
-and the required remapping procedure are described on pages 18–21
-([CANopen manual, pp. 18–21](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=18)).
+Mappings pack `index`, `subindex`, and bit length; RPDO1 is six bytes and TPDO4
+eight. Transmission types and remapping: [manual pp. 18–21](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=18).
 
 ### One CSP command/feedback cycle
 
@@ -634,9 +604,7 @@ After the drive is in CSP and Operation Enabled, one cycle is:
 6. Reject feedback if fault bit 3 is set or the masked state is not Operation
    Enabled (`0x0027`).
 
-The zero-payload SYNC frame and its synchronous RxPDO/TxPDO behavior are
-specified on page 27
-([CANopen manual, p. 27](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=27)).
+SYNC and synchronous PDO behavior: [manual p. 27](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=27).
 
 Illustrative node-1 frames for raw target `-12345` and feedback current
 `+250 mA` are:
@@ -668,10 +636,8 @@ calibrated travel must already be correct.
    transition.
 8. Send the current position followed by SYNC and read the first TPDO4.
 
-The NMT Start command is tabulated on pages 28–29, and the enable sequence is
-the worked example on page 41
-([CANopen manual, pp. 28–29](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=28),
-[p. 41](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=41)).
+Vendor references: [NMT Start, pp. 28–29](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=28),
+[drive-enable example, p. 41](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=41).
 
 If any step fails, `start()` requests a quick stop where possible and executes
 the normal restoration path.
@@ -688,9 +654,7 @@ the normal restoration path.
 6. restores continuous and peak current limits; and
 7. closes the SocketCAN bus.
 
-Quick Stop, Disable Voltage, and the other Controlword state commands are
-defined on pages 40–42
-([CANopen manual, pp. 40–42](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=40)).
+Quick Stop and Disable Voltage: [manual pp. 40–42](../EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=40).
 
 A restoration failure is printed but does not prevent the remaining cleanup
 steps. Normal ROS shutdown disables the drive without Quick Stop; worker or
