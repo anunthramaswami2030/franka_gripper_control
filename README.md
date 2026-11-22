@@ -122,32 +122,9 @@ python3 -m franka_gripper_control.check_faulhaber_connection \
 
 Continue only when the final line reports `RESULT: HEALTHY`. The checker reads
 controller state and CAN error counters but does not enable or move the drive.
-
-The checker:
-
-1. records the kernel CAN state and error counters;
-2. sends a node-guard remote request
-   ([CANopen manual, pp. 30–31](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=30));
-3. reads device type, statusword, active mode, position, velocity, and current
-   with expedited SDO uploads
-   ([CANopen manual, pp. 22–24](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=22));
-4. passively observes boot-up, emergency, and CAN error frames
-   ([CANopen manual, pp. 25–26](docs/EN_7000_05037_CANopen_Communication_Function_Manual.pdf#page=25)); and
-5. verifies that kernel error counters did not increase.
-
-It does **not** send NMT state changes, Controlwords, mode writes, PDOs, SYNC,
-or motion targets. A healthy result verifies communication; it does not verify
-that motion is mechanically safe.
-
-Useful checker options are:
-
-| Option | Default | Meaning |
-|---|---:|---|
-| `--interface` | `can0` | SocketCAN interface |
-| `--node-id` | `1` | CANopen node ID, from 1 through 127 |
-| `--samples` | `10` | Number of statusword samples |
-| `--interval` | `0.5` s | Passive observation time after each sample |
-| `--response-timeout` | `1.0` s | Per-request timeout |
+A healthy result verifies communication, not mechanical safety. See the
+[connection-checker reference](docs/api/README.md#connection-checker) for
+the checks performed and command-line options.
 
 ### 4. Start the ROS node
 
